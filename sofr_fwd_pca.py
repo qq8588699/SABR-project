@@ -1348,35 +1348,28 @@ def build_loading_correlation(
     pca_result: dict,
 ) -> dict:
     """
-    Build the G5++ loading matrix and factor correlation matrix.
+    Build the G5++ factor correlation matrix from correlation PCA.
 
     Construction
     ------------
     PCA is performed on the correlation matrix R (see run_pca).
-    The top-K eigenvectors V_{R,K} capture pure correlation shapes
-    (level / slope / curvature) free of per-tenor volatility distortion.
-    The G5++ loading matrix reintroduces per-tenor volatility:
+    The top-K eigenvectors V_{R,K} are (n x K) and already live in
+    correlation space — each column is a unit-norm shape (level, slope,
+    curvature, ...) with no per-tenor volatility mixed in.
 
-        L = D * V_{R,K} * Lambda_{R,K}^{1/2}        (n x K)
+    Extract the K x K sub-block from the first K rows of V_{R,K}:
 
-    where D = diag(sigma_1,...,sigma_n) are the per-tenor daily vols
-    from sqrt(Sigma_diff[j,j]).  This gives:
+        V_fac    = V_{R,K}[:K, :]               (K x K)
 
-        L L^T  ~=  D R D  =  Sigma_diff               (K-factor approximation)
+    Row-normalise so each factor has unit self-correlation:
 
-    so L[j,k] is the loading of G5++ factor k on tenor j, and the
-    model forward rate covariance L L^T approximates Sigma_diff with
-    correct per-tenor volatility scaling.
+        V_fac_rn = V_fac / row_norms            (K x K)
+        rho      = V_fac_rn @ V_fac_rn.T        (K x K, unit diagonal)
 
-    For the G5++ factor correlation matrix (used for Cholesky
-    decomposition of the model), extract the K x K factor block:
-
-        L_fac    = L[:K, :]                           (K x K sub-block)
-        L_fac_rn = L_fac / row_norms                  (row-normalised)
-        rho      = L_fac_rn @ L_fac_rn.T              (K x K, unit diagonal)
-
-    Row normalisation ensures rho[k,k] = 1 exactly, compensating for
-    the variance not captured by the K-component truncation.
+    This is the G5++ inter-factor correlation matrix used for the
+    Cholesky decomposition.  It is purely correlation-based: no
+    per-tenor volatility (D) and no eigenvalue scaling (Lambda^{1/2})
+    are applied here.
 
     Parameters
     ----------
@@ -1385,42 +1378,35 @@ def build_loading_correlation(
     Returns
     -------
     dict with keys:
-        L          : (n, n_factors)   full loading matrix (tenor x factor)
-        L_fac      : (n_factors, n_factors)  factor sub-block of L
-        L_fac_rn   : (n_factors, n_factors)  row-normalised factor block
+        V_fac      : (n_factors, n_factors)  raw factor sub-block of V_{R,K}
+        V_fac_rn   : (n_factors, n_factors)  row-normalised factor block
         rho        : (n_factors, n_factors)  G5++ factor correlation matrix
-        row_norms  : (n_factors,) row norms of L_fac (pre-normalisation)
+        row_norms  : (n_factors,) row norms of V_fac (pre-normalisation)
         var_explained : float  fraction of correlation variance in top-K
     """
-    n_factors    = pca_result["n_factors"]
-    eigvals_K    = pca_result["top_eigenvalues"]          # (K,)
-    eigvecs_K    = pca_result["top_eigenvectors"]         # (n, K)
-    tenor_vols   = pca_result["tenor_vols"]               # (n,)
-    D            = np.diag(tenor_vols)                    # (n, n)
+    n_factors = pca_result["n_factors"]
+    eigvecs_K = pca_result["top_eigenvectors"]   # (n, K)
 
-    # G5++ loading matrix: L = D V_{R,K} Lambda_{R,K}^{1/2}  shape (n, K)
-    L = D @ eigvecs_K * np.sqrt(eigvals_K[np.newaxis, :])
-
-    # Factor sub-block for correlation (first K rows of L)
-    L_fac     = L[:n_factors, :]                          # (K, K)
-    row_norms = np.sqrt(np.sum(L_fac ** 2, axis=1))       # (K,)
+    # K x K sub-block: first K rows of the correlation eigenvectors
+    V_fac     = eigvecs_K[:n_factors, :]                    # (K, K)
+    row_norms = np.sqrt(np.sum(V_fac ** 2, axis=1))         # (K,)
 
     # Row-normalise -> unit diagonal correlation matrix
-    denom    = np.where(row_norms > 1e-12, row_norms, 1.0)
-    L_fac_rn = L_fac / denom[:, np.newaxis]
+    denom     = np.where(row_norms > 1e-12, row_norms, 1.0)
+    V_fac_rn  = V_fac / denom[:, np.newaxis]
 
-    rho = L_fac_rn @ L_fac_rn.T
+    rho = V_fac_rn @ V_fac_rn.T
     np.fill_diagonal(rho, 1.0)   # enforce exact unit diagonal
 
-    var_explained = eigvals_K.sum() / pca_result["eigenvalues"].sum()
+    var_explained = (pca_result["top_eigenvalues"].sum()
+                     / pca_result["eigenvalues"].sum())
 
     return {
-        "L":              L,
-        "L_fac":          L_fac,
-        "L_fac_rn":       L_fac_rn,
-        "rho":            rho,
-        "row_norms":      row_norms,
-        "var_explained":  var_explained,
+        "V_fac":         V_fac,
+        "V_fac_rn":      V_fac_rn,
+        "rho":           rho,
+        "row_norms":     row_norms,
+        "var_explained": var_explained,
     }
 
 
@@ -1485,7 +1471,7 @@ def print_pca_summary(pca_result: dict, loading_result: dict) -> None:
     print(f"  Variance in top-{n_f}: "
           f"{100*loading_result['var_explained']:.2f}%")
     print()
-    print(f"  Row norms of L_fac (pre-normalisation):")
+    print(f"  Row norms of V_fac (pre-normalisation):")
     for k, rn in enumerate(loading_result["row_norms"]):
         print(f"    Factor {k+1}: {rn:.4f}")
     print()
@@ -2038,8 +2024,8 @@ def plot_tenor_histograms(
 # =============================================================================
 
 def run_pipeline(
-    zero_rates: np.ndarray,
-    pillar_tenors: np.ndarray,
+    zero_rates,
+    pillar_tenors=None,
     dates=None,
     n_factors: int = 5,
     jump_kwargs: dict = None,
@@ -2066,10 +2052,18 @@ def run_pipeline(
       - {prefix}_jump_diagnostic.png     : 4-panel jump diagnostic
       - {prefix}_tenor_histograms.png    : per-tenor histogram grid
 
-    Typical usage
-    -------------
+    Typical usage — DataFrame input (preferred)
+    -------------------------------------------
+        import pandas as pd
         import sofr_fwd_pca as sfp
 
+        # df.columns = tenor strings ("0.25Y", "1Y", "2Y", ...)
+        # df.index   = dates (strings or datetime)
+        df = pd.read_csv("sofr_zeros.csv", index_col=0)
+        result = sfp.run_pipeline(df, output_dir="./outputs")
+
+    Typical usage — array input (backward compatible)
+    --------------------------------------------------
         zero_rates, pillar_tenors, dates = sfp.load_zero_rates_csv("sofr_zeros.csv")
         result = sfp.run_pipeline(
             zero_rates    = zero_rates,
@@ -2080,11 +2074,18 @@ def run_pipeline(
 
     Parameters
     ----------
-    zero_rates    : (T, n) array  zero rates in decimal, rows = dates,
-                                  columns = pillar tenors (ascending)
-    pillar_tenors : (n,) array    tenor grid in years, strictly ascending;
-                                  must have same length as zero_rates columns
-    dates         : (T,) array or None  date labels (strings)
+    zero_rates    : pd.DataFrame  rows = dates (index), columns = tenor strings;
+                                  values are zero rates in decimal.
+                   OR (T, n) array-like  zero rates in decimal, in which case
+                                  pillar_tenors must also be supplied.
+    pillar_tenors : (n,) array-like or None
+                                  tenor grid in years, strictly ascending.
+                                  Required when zero_rates is an array;
+                                  ignored (parsed from df.columns) when a
+                                  DataFrame is passed.
+    dates         : (T,) array-like or None
+                                  date labels.  Ignored when zero_rates is a
+                                  DataFrame (dates are taken from df.index).
     n_factors     : int           PCA components to retain (default 5)
     jump_kwargs   : dict or None  override detect_jumps() defaults:
                                   window, alpha_bpv, alpha_mah, n_iter, reg
@@ -2112,13 +2113,37 @@ def run_pipeline(
         pca_result      : dict  output of run_pca()
         loading_result  : dict  output of build_loading_correlation()
         rho             : (n_factors, n_factors) G5++ factor correlation
-        L               : (n, n_factors) loading matrix D V_{R,K} Lambda_{R,K}^{1/2}
         kappa0          : (n_factors,) log-spaced kappa initialisation
         beta0           : float  beta init (moment-matched from rho_kl)
         csv_paths       : dict  {filename: full_path} for each file written
     """
-    zero_rates    = np.asarray(zero_rates,    dtype=float)
-    pillar_tenors = np.asarray(pillar_tenors, dtype=float)
+    # ------------------------------------------------------------------
+    # Input normalisation: accept either a DataFrame or raw arrays
+    # ------------------------------------------------------------------
+    try:
+        import pandas as _pd
+        _is_df = isinstance(zero_rates, _pd.DataFrame)
+    except ImportError:
+        _is_df = False
+
+    if _is_df:
+        df = zero_rates
+        # If dates are in descending order, flip to ascending
+        if len(df) > 1 and df.index[0] > df.index[1]:
+            df = df.iloc[::-1]
+        # Parse pillar tenors from column names
+        pillar_tenors = np.array([_parse_tenor(str(c)) for c in df.columns],
+                                 dtype=float)
+        # Dates from index
+        dates         = np.array([str(d) for d in df.index])
+        zero_rates    = df.values.astype(float)
+    else:
+        zero_rates    = np.asarray(zero_rates,    dtype=float)
+        if pillar_tenors is None:
+            raise ValueError(
+                "pillar_tenors must be supplied when zero_rates is not a DataFrame."
+            )
+        pillar_tenors = np.asarray(pillar_tenors, dtype=float)
 
     if zero_rates.ndim != 2:
         raise ValueError(
@@ -2302,7 +2327,6 @@ def run_pipeline(
         "pca_result":      pca_result,
         "loading_result":  loading_result,
         "rho":             loading_result["rho"],
-        "L":               loading_result["L"],
         "kappa0":          kappa0,
         "beta0":           beta0,
         "csv_paths":       csv_paths,
