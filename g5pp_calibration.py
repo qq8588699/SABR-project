@@ -318,9 +318,13 @@ def pca_loading_correlation(
        PCA on R gives pure correlation shapes free of vol distortion.
        PCA on Sigma_diff directly would tilt eigenvectors toward high-vol
        tenors (typically short end), distorting the loading matrix.
-    3. Loading matrix L = D V_{R,K} Lambda_{R,K}^{1/2}  (n x K)
-       so that L L^T ~= Sigma_diff (K-factor approximation).
-    4. Factor correlation rho = L_fac_rn @ L_fac_rn.T  (unit diagonal).
+    3. Factor correlation rho is derived from the top-K correlation
+       eigenvectors V_{R,K} alone — no per-tenor vol scaling (D) and no
+       eigenvalue scaling (Lambda^{1/2}) are applied.  This keeps rho
+       purely in correlation space:
+         V_fac    = V_{R,K}[:K, :]          (K x K sub-block)
+         V_fac_rn = row-normalised V_fac    (unit diagonal)
+         rho      = V_fac_rn @ V_fac_rn.T  (K x K, unit diagonal)
 
     Note
     ----
@@ -338,7 +342,6 @@ def pca_loading_correlation(
     Returns
     -------
     rho         : (n_factors, n_factors) ndarray  PSD correlation matrix, unit diagonal
-    L           : (n, n_factors) ndarray  loading matrix D V_{R,K} Lambda_{R,K}^{1/2}
     jump_result : dict or None  output of detect_jumps(), or None if skipped
     """
     jump_result = None
@@ -354,7 +357,7 @@ def pca_loading_correlation(
     T, n = delta_f_clean.shape
 
     # Sample covariance of cleaned changes
-    mu = delta_f_clean.mean(axis=0)
+    mu  = delta_f_clean.mean(axis=0)
     X_c = delta_f_clean - mu
     Sigma = X_c.T @ X_c / (T - 1)
 
@@ -364,25 +367,20 @@ def pca_loading_correlation(
     R = D_inv @ Sigma @ D_inv
     np.fill_diagonal(R, 1.0)
 
-    # Eigendecompose R (eigh returns ascending order; reverse)
-    eigenvalues, eigenvectors = eigh(R)
-    eigenvalues  = eigenvalues[::-1][:n_factors]
-    eigenvectors = eigenvectors[:, ::-1][:, :n_factors]
+    # Eigendecompose R (eigh returns ascending order; reverse to descending)
+    _, eigenvectors = eigh(R)
+    eigenvectors = eigenvectors[:, ::-1][:, :n_factors]   # (n, K)
 
-    # Loading matrix: L = D V_{R,K} Lambda_{R,K}^{1/2}  shape (n, K)
-    D = np.diag(tenor_vols)
-    L = D @ eigenvectors * np.sqrt(eigenvalues[np.newaxis, :])
-
-    # Factor sub-block and row-normalisation
-    L_fac     = L[:n_factors, :]                         # (K, K)
-    row_norms = np.sqrt(np.sum(L_fac ** 2, axis=1, keepdims=True))
+    # Factor sub-block: first K rows of V_{R,K} — pure correlation space
+    V_fac     = eigenvectors[:n_factors, :]               # (K, K)
+    row_norms = np.sqrt(np.sum(V_fac ** 2, axis=1, keepdims=True))
     row_norms = np.where(row_norms < 1e-12, 1.0, row_norms)
-    L_fac_rn  = L_fac / row_norms
+    V_fac_rn  = V_fac / row_norms
 
-    rho = L_fac_rn @ L_fac_rn.T
+    rho = V_fac_rn @ V_fac_rn.T
     np.fill_diagonal(rho, 1.0)
 
-    return rho, L, jump_result
+    return rho, jump_result
 
 
 def correlation_matrix(
@@ -431,7 +429,7 @@ def correlation_matrix(
     elif rho_mode == "pca":
         if delta_f is None:
             raise ValueError("delta_f must be provided for rho_mode='pca'")
-        rho, _, _ = pca_loading_correlation(delta_f, n_factors)
+        rho, _ = pca_loading_correlation(delta_f, n_factors)
         return rho
     else:
         raise ValueError(
@@ -999,7 +997,7 @@ class G5ppCalibrator:
         # beta0: moment-match to PCA-implied correlation if available,
         # else use default 0.3
         if self.delta_f is not None and self.rho_mode == "exponential":
-            rho_pca, _, _ = pca_loading_correlation(self.delta_f, remove_jumps=True)
+            rho_pca, _ = pca_loading_correlation(self.delta_f, remove_jumps=True)
             beta0 = init_beta_from_rho(rho_pca)
             print(f"beta^{{(0)}} = {beta0:.4f}  (moment-matched from PCA rho)")
         else:
@@ -1296,7 +1294,7 @@ if __name__ == "__main__":
         rho_mode="pca",
     )
     result_pca = calib_pca.calibrate(n_restarts=2, verbose=True)
-    rho_pca, L_pca, jres = pca_loading_correlation(synthetic_df, verbose=True)
+    rho_pca, jres = pca_loading_correlation(synthetic_df, verbose=True)
     print(f"PCA correlation matrix (top-left 3x3):\n{result_pca['rho'][:3,:3].round(3)}")
     if jres is not None:
         print(f"Jump days detected: {jres['n_jumps']} "

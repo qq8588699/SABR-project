@@ -1493,209 +1493,300 @@ def plot_jump_histograms(
     delta_f: np.ndarray,
     jump_result: dict,
     fwd_tenors: np.ndarray,
-    representative_tenor: float = 2.0,
-    n_bins: int = 80,
-    figsize: tuple = (16, 11),
-    save_path: str = None,
+    n_bins: int = 60,
+    show_stage1: bool = True,
+    show_stage2: bool = True,
+    hist_figsize: tuple = (10, 4),
+    qq_figsize: tuple = (15, None),
+    qq_split_threshold: int = 12,
+    save_path_hist: str = None,
+    save_path_qq: str = None,
+    save_path_stage1: str = None,
+    save_path_stage2: str = None,
 ) -> None:
     """
-    Four-panel diagnostic figure comparing daily forward rate change distributions
-    before and after jump removal.
+    Jump-detection diagnostic plots.  Produces up to four separate outputs:
 
-    Panels
-    ------
-    Top-left  : Overlaid histograms (raw vs clean) for a representative tenor,
-                with fitted normal densities and excess-kurtosis annotations.
-    Top-right : Normal Q-Q plot for the same tenor — raw (grey) vs clean (blue).
-                A straight 45° line indicates Gaussianity; fat tails curve away.
-    Bottom-left  : Per-day maximum MAD z-score distribution (Stage-1 statistic)
-                   with the detection threshold marked.  Jump days shown in red.
-    Bottom-right : Per-day Mahalanobis D² distribution (Stage-2 statistic) with
-                   the chi² critical value and the theoretical chi² density overlaid.
+    1. Per-tenor histogram figures (one figure per tenor, always produced)
+       Left  : histogram of raw daily Δf (bps) with fitted normal density
+       Right : histogram after jump cleaning with fitted normal density
+       Both panels annotate μ, σ, and excess kurtosis.
+
+    2. Normal Q-Q figure(s) (always produced)
+       If n_tenors <= qq_split_threshold: one figure, all tenors, 3 per row.
+       If n_tenors >  qq_split_threshold: two figures (first/second half),
+         each 3 per row.  The second file gets a "_part2" suffix.
+       3 per row.  The second figure's save path gets a "_part2" suffix.
+
+    3. Stage-1 bipower score figure  [produced only when show_stage1=True]
+       Per-day fraction of tenors with a Stage-1 jump cell, coloured by
+       whether the day was flagged as a jump day.
+
+    4. Stage-2 Mahalanobis D² figure  [produced only when show_stage2=True]
+       Per-day D² statistic with chi² threshold and reference density.
 
     Parameters
     ----------
-    delta_f              : (T, m) array   all daily forward rate changes (raw)
-    jump_result          : dict           output of detect_jumps()
-    fwd_tenors           : (m,) array     tenor labels for each column of delta_f
-    representative_tenor : float          target tenor (years) for panels 1 & 2;
-                                          nearest available tenor is used (default 2.0)
-    n_bins               : int            histogram bin count (default 80)
-    figsize              : tuple          figure size in inches
-    save_path            : str or None    if given, save to this path (png/pdf);
-                                          otherwise display interactively
+    delta_f          : (T, m) array   raw daily forward rate changes
+    jump_result      : dict           output of detect_jumps()
+    fwd_tenors       : (m,) array     tenor label (years) for each column
+    n_bins           : int            histogram bin count (default 60)
+    show_stage1         : bool   produce Stage-1 bipower score plot (default True)
+    show_stage2         : bool   produce Stage-2 Mahalanobis D² plot (default True)
+    hist_figsize        : tuple  (width, height) for each per-tenor histogram figure
+    qq_figsize          : tuple  (width, height) for Q-Q figure(s);
+                                 height=None auto-sizes from number of rows
+    qq_split_threshold  : int    max tenors to fit in one Q-Q figure (default 12);
+                                 if n_tenors <= threshold -> single figure;
+                                 if n_tenors >  threshold -> two figures (halves)
+    save_path_hist      : str or None  base path for tenor histograms; saved as
+                                       "{save_path_hist}_{tenor}.png"
+    save_path_qq        : str or None  path for Q-Q figure; second figure (if split)
+                                       gets a "_part2" suffix before the extension
+    save_path_stage1    : str or None  path for the Stage-1 figure
+    save_path_stage2    : str or None  path for the Stage-2 figure
     """
     import matplotlib.pyplot as plt
-    import matplotlib.gridspec as gridspec
     from scipy.stats import norm as _norm, kurtosis as _kurt, chi2 as _chi2
 
     fwd_tenors = np.asarray(fwd_tenors)
+    n_tenors   = len(fwd_tenors)
+    T          = len(delta_f)
+    n_tens     = delta_f.shape[1]
+    jump_mask  = jump_result["stage1_day_mask"]
+    df_clean2  = jump_result["delta_f_clean2"]   # Stage-1 + Stage-2 cleaned
 
-    # Nearest available tenor to the requested representative
-    col_idx   = int(np.argmin(np.abs(fwd_tenors - representative_tenor)))
-    tau_label = f"{fwd_tenors[col_idx]:.2f}Y"
+    C_RAW   = "#9B9B9B"
+    C_CLEAN = "#2166AC"
+    C_JUMP  = "#D6604D"
+    C_THRSH = "#E08A00"
+    C_CHI2  = "#4DAC26"
+    ALPHA_H = 0.60
 
-    jump_mask = jump_result["stage1_day_mask"]  # Stage-1 only: cells were modified
-    df_raw    = delta_f[:, col_idx] * 1e4                           # raw (bps)
-    df_clean  = jump_result["delta_f_clean2"][:, col_idx] * 1e4     # S1+S2 cleaned (bps)
-
-    # ── palette ───────────────────────────────────────────────────────────────
-    C_RAW   = "#9B9B9B"   # grey
-    C_CLEAN = "#2166AC"   # blue
-    C_JUMP  = "#D6604D"   # red
-    C_THRSH = "#E08A00"   # amber — threshold lines
-    C_CHI2  = "#4DAC26"   # green — chi² reference
-    ALPHA_H = 0.55
-
-    fig = plt.figure(figsize=figsize, facecolor="white")
-    fig.suptitle(
-        "Daily Forward Rate Changes — Before vs After Jump Subtraction\n"
-        f"All {len(delta_f)} days retained  |  "
-        f"{jump_result['n_stage1_days']} days had per-tenor jumps subtracted  "
-        f"(+{jump_result['n_stage2_days']} excluded from Sigma_diff only)",
-        fontsize=12, fontweight="bold", y=0.99,
-    )
-    gs = gridspec.GridSpec(2, 2, figure=fig, hspace=0.40, wspace=0.32)
-
-    # ── Panel 1: Overlaid histograms ─────────────────────────────────────────
-    ax1 = fig.add_subplot(gs[0, 0])
-
-    mu_c, sig_c = df_clean.mean(), df_clean.std()
-    bin_lo = mu_c - 5.5 * sig_c
-    bin_hi = mu_c + 5.5 * sig_c
-    bins   = np.linspace(bin_lo, bin_hi, n_bins + 1)
-
-    ax1.hist(df_raw,   bins=bins, density=True, color=C_RAW,
-             alpha=ALPHA_H, label="Raw",   zorder=2, linewidth=0.3, edgecolor="white")
-    ax1.hist(df_clean, bins=bins, density=True, color=C_CLEAN,
-             alpha=ALPHA_H, label="Clean", zorder=3, linewidth=0.3, edgecolor="white")
-
-    # Fitted normal densities
-    x_fit = np.linspace(bin_lo, bin_hi, 300)
-    ax1.plot(x_fit, _norm.pdf(x_fit, df_raw.mean(),   df_raw.std()),
-             color=C_RAW,   lw=1.8, ls="--", zorder=4, label="_fitted raw")
-    ax1.plot(x_fit, _norm.pdf(x_fit, mu_c, sig_c),
-             color=C_CLEAN, lw=1.8, ls="--", zorder=5, label="_fitted clean")
-
-    kurt_raw   = _kurt(df_raw,   fisher=True)
-    kurt_clean = _kurt(df_clean, fisher=True)
-    ax1.text(
-        0.97, 0.97,
-        f"Excess kurtosis\n"
-        f"  Raw  : {kurt_raw:+.2f}\n"
-        f"  Clean: {kurt_clean:+.2f}\n"
-        f"  Normal: 0.00",
-        transform=ax1.transAxes, ha="right", va="top",
-        fontsize=8, family="monospace",
-        bbox=dict(boxstyle="round,pad=0.35", fc="white", ec="#CCCCCC", alpha=0.9),
-    )
-    ax1.set_title(f"Histogram — Δf at {tau_label} tenor (bps)", fontsize=10)
-    ax1.set_xlabel("Δf  (bps)", fontsize=9)
-    ax1.set_ylabel("Density", fontsize=9)
-    ax1.legend(fontsize=8.5, framealpha=0.85, loc="upper left")
-    ax1.tick_params(labelsize=8)
-
-    # ── Panel 2: Q-Q plots ───────────────────────────────────────────────────
-    ax2 = fig.add_subplot(gs[0, 1])
+    def _spine_clean(ax):
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+        ax.grid(axis="y", lw=0.4, alpha=0.5, color="#DDDDDD", zorder=0)
 
     def _qq(x):
         xs = np.sort((x - x.mean()) / x.std())
         n  = len(xs)
         return _norm.ppf((np.arange(1, n + 1) - 0.5) / n), xs
 
-    th_r, em_r = _qq(df_raw)
-    th_c, em_c = _qq(df_clean)
+    def _save_or_show(fig, path, label):
+        if path:
+            fig.savefig(path, dpi=150, bbox_inches="tight")
+            print(f"  {label} saved: {path}")
+        else:
+            plt.show()
+        plt.close(fig)
 
-    ax2.scatter(th_r, em_r, color=C_RAW,   s=5,  alpha=0.45,
-                label="Raw",   zorder=2, rasterized=True)
-    ax2.scatter(th_c, em_c, color=C_CLEAN, s=6,  alpha=0.55,
-                label="Clean", zorder=3, rasterized=True)
+    # =========================================================================
+    # 1. Per-tenor histogram figures — one figure per tenor, left=raw right=clean
+    # =========================================================================
+    for j in range(n_tenors):
+        tau_label = f"{fwd_tenors[j]:.4g}Y"
+        raw_bps   = delta_f[:, j]   * 1e4
+        cln_bps   = df_clean2[:, j] * 1e4
 
-    lim = max(abs(th_r).max(), abs(em_r).max()) * 1.08
-    ax2.plot([-lim, lim], [-lim, lim], color="black", lw=1.2,
-             ls="--", zorder=4, label="N(0,1) line")
+        mu_c, sig_c = cln_bps.mean(), cln_bps.std()
+        bin_lo = mu_c - 5.5 * sig_c
+        bin_hi = mu_c + 5.5 * sig_c
+        bins   = np.linspace(bin_lo, bin_hi, n_bins + 1)
+        x_fit  = np.linspace(bin_lo, bin_hi, 300)
 
-    ax2.set_xlim(-lim, lim)
-    ax2.set_ylim(-lim, lim)
-    ax2.set_title(f"Normal Q–Q — Δf at {tau_label} tenor", fontsize=10)
-    ax2.set_xlabel("Theoretical N(0,1) quantile", fontsize=9)
-    ax2.set_ylabel("Empirical quantile (standardised)", fontsize=9)
-    ax2.legend(fontsize=8.5, framealpha=0.85)
-    ax2.tick_params(labelsize=8)
+        fig, (ax_l, ax_r) = plt.subplots(
+            1, 2, figsize=hist_figsize, facecolor="white"
+        )
+        fig.suptitle(
+            f"Δf Histogram — {tau_label} tenor  "
+            f"({T} days  |  {jump_result['n_stage1_days']} Stage-1 jump days)",
+            fontsize=11, fontweight="bold",
+        )
 
-    # ── Panel 3: Stage-1 bipower score ──────────────────────────────────────
-    ax3 = fig.add_subplot(gs[1, 0])
-    bpv_s = jump_result["bpv_score"]
-    bpv_bins = np.linspace(0, 1, n_bins + 1)
+        for ax, data, color, title in [
+            (ax_l, raw_bps, C_RAW,   "Before cleaning (raw)"),
+            (ax_r, cln_bps, C_CLEAN, "After cleaning"),
+        ]:
+            ax.hist(data, bins=bins, density=True, color=color,
+                    alpha=ALPHA_H, linewidth=0.3, edgecolor="white", zorder=2)
+            ax.plot(x_fit, _norm.pdf(x_fit, data.mean(), data.std()),
+                    color=color, lw=1.8, ls="--", zorder=3)
+            kurt = _kurt(data, fisher=True)
+            ax.text(
+                0.97, 0.97,
+                f"μ = {data.mean():+.2f} bps\n"
+                f"σ = {data.std():.2f} bps\n"
+                f"Excess kurt = {kurt:+.2f}",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=8, family="monospace",
+                bbox=dict(boxstyle="round,pad=0.3", fc="white",
+                          ec="#CCCCCC", alpha=0.9),
+            )
+            ax.set_title(title, fontsize=10)
+            ax.set_xlabel("Δf  (bps)", fontsize=9)
+            ax.set_ylabel("Density", fontsize=9)
+            ax.tick_params(labelsize=8)
+            _spine_clean(ax)
 
-    ax3.hist(bpv_s[~jump_mask], bins=bpv_bins, color=C_CLEAN, alpha=ALPHA_H,
-             label="Clean days", zorder=2, linewidth=0.3, edgecolor="white")
-    ax3.hist(bpv_s[ jump_mask], bins=bpv_bins, color=C_JUMP,  alpha=0.75,
-             label="Jump days",  zorder=3, linewidth=0.3, edgecolor="white")
+        fig.tight_layout()
+        path = (f"{save_path_hist}_{tau_label.replace('.', 'p')}.png"
+                if save_path_hist else None)
+        _save_or_show(fig, path, f"Histogram [{tau_label}]")
 
-    # bpv_score = fraction of tenors with a jump cell on this day (diagnostic)
-    # No threshold line: each tenor is tested independently
+    # =========================================================================
+    # 2. Q-Q figure(s) — single figure when tenors <= threshold, else two halves
+    # =========================================================================
+    N_COLS = 3
 
-    ax3.set_title("Stage 1 — Bipower sliding-window score per day", fontsize=10)
-    ax3.set_xlabel(r"Fraction of tenors breaching bipower $\Phi^{-1}(\alpha_{bpv})$ bounds", fontsize=9)
-    ax3.set_ylabel("Count", fontsize=9)
-    ax3.set_xlim(0, 1)
-    ax3.legend(fontsize=8.5, framealpha=0.85)
-    ax3.tick_params(labelsize=8)
-
-    # ── Panel 4: Stage-2 Mahalanobis D² ─────────────────────────────────────
-    ax4 = fig.add_subplot(gs[1, 1])
-    d2      = jump_result["mahal_d2"]
-    chi2_th = jump_result["chi2_threshold"]
-    n_tens  = delta_f.shape[1]
-
-    d2_cap      = max(chi2_th * 4.0,
-                      np.percentile(d2[~jump_mask], 99) * 1.5 if (~jump_mask).any() else chi2_th * 4)
-    d2_disp     = np.clip(d2, 0, d2_cap)
-    d2_bins     = np.linspace(0, d2_cap, n_bins + 1)
-    n_offscale2 = int((d2 > d2_cap).sum())
-
-    ax4.hist(d2_disp[~jump_mask], bins=d2_bins, color=C_CLEAN, alpha=ALPHA_H,
-             label="Clean days", zorder=2, linewidth=0.3, edgecolor="white")
-    ax4.hist(d2_disp[ jump_mask], bins=d2_bins, color=C_JUMP,  alpha=0.75,
-             label="Jump days",  zorder=3, linewidth=0.3, edgecolor="white")
-    ax4.axvline(chi2_th, color=C_THRSH, lw=2.0, ls="--", zorder=5,
-                label=f"$\\chi^2_{{0.999}}$({n_tens}) = {chi2_th:.0f}")
-
-    # Theoretical chi² reference density (scaled to count units)
-    n_clean_d2 = int(jump_result["chi2_threshold"] > 0)  # always all T days
-    bw_d2      = d2_bins[1] - d2_bins[0]
-    x_chi2     = np.linspace(max(0.1, n_tens * 0.3), d2_cap, 400)
-    ax4.plot(x_chi2, _chi2.pdf(x_chi2, df=n_tens) * n_clean_d2 * bw_d2,
-             color=C_CHI2, lw=1.8, ls="-", zorder=4,
-             label=f"$\\chi^2$({n_tens}) reference")
-
-    if n_offscale2 > 0:
-        ax4.text(0.97, 0.91,
-                 f"+{n_offscale2} obs off-scale →",
-                 transform=ax4.transAxes, ha="right", va="top",
-                 fontsize=8, color=C_JUMP)
-
-    ax4.set_title("Stage 2 — Mahalanobis $D^2$ per day", fontsize=10)
-    ax4.set_xlabel(
-        r"$D_t^2 = \Delta f(t)^\top\,\hat\Sigma^{-1}\,\Delta f(t)$", fontsize=9)
-    ax4.set_ylabel("Count", fontsize=9)
-    ax4.legend(fontsize=8.5, framealpha=0.85)
-    ax4.tick_params(labelsize=8)
-
-    # ── polish ────────────────────────────────────────────────────────────────
-    for ax in [ax1, ax2, ax3, ax4]:
-        ax.spines["top"].set_visible(False)
-        ax.spines["right"].set_visible(False)
-        ax.grid(axis="y", lw=0.4, alpha=0.5, color="#DDDDDD", zorder=0)
-
-    if save_path:
-        fig.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"  Figure saved: {save_path}")
+    if n_tenors <= qq_split_threshold:
+        # Single figure: all tenors
+        index_groups = [(list(range(n_tenors)), "Q-Q figure", save_path_qq)]
     else:
-        plt.tight_layout()
-        plt.show()
-    plt.close(fig)
+        # Two figures: first half and second half
+        split = (n_tenors + 1) // 2
+        if save_path_qq and "." in save_path_qq:
+            base, ext = save_path_qq.rsplit(".", 1)
+            sp2 = f"{base}_part2.{ext}"
+        elif save_path_qq:
+            sp2 = f"{save_path_qq}_part2"
+        else:
+            sp2 = None
+        index_groups = [
+            (list(range(0,     split)),    "Q-Q figure (part 1)", save_path_qq),
+            (list(range(split, n_tenors)), "Q-Q figure (part 2)", sp2),
+        ]
+
+    def _draw_qq_figure(indices, fig_label, sp):
+        n_sub  = len(indices)
+        n_rows = (n_sub + N_COLS - 1) // N_COLS
+        qq_h   = qq_figsize[1] if qq_figsize[1] is not None else 4.0 * n_rows
+
+        fig_qq, axes_qq = plt.subplots(
+            n_rows, N_COLS,
+            figsize=(qq_figsize[0], qq_h),
+            facecolor="white",
+            squeeze=False,
+        )
+        fig_qq.suptitle(
+            f"Normal Q–Q plots — Raw (grey) vs Cleaned (blue)"
+            + (f"  [{fig_label.split('(')[-1].rstrip(')')}]"
+               if "part" in fig_label else ""),
+            fontsize=12, fontweight="bold", y=1.01,
+        )
+
+        for sub_idx, j in enumerate(indices):
+            row, col  = divmod(sub_idx, N_COLS)
+            ax        = axes_qq[row][col]
+            tau_label = f"{fwd_tenors[j]:.4g}Y"
+            raw_bps   = delta_f[:, j]   * 1e4
+            cln_bps   = df_clean2[:, j] * 1e4
+
+            th_r, em_r = _qq(raw_bps)
+            th_c, em_c = _qq(cln_bps)
+
+            ax.scatter(th_r, em_r, color=C_RAW,   s=4, alpha=0.40,
+                       label="Raw",     zorder=2, rasterized=True)
+            ax.scatter(th_c, em_c, color=C_CLEAN, s=5, alpha=0.55,
+                       label="Cleaned", zorder=3, rasterized=True)
+
+            lim = max(abs(th_r).max(), abs(em_r).max()) * 1.08
+            ax.plot([-lim, lim], [-lim, lim], color="black",
+                    lw=1.0, ls="--", zorder=4)
+            ax.set_xlim(-lim, lim)
+            ax.set_ylim(-lim, lim)
+            ax.set_title(tau_label, fontsize=9)
+            ax.set_xlabel("Theoretical", fontsize=8)
+            ax.set_ylabel("Empirical",   fontsize=8)
+            ax.tick_params(labelsize=7)
+            _spine_clean(ax)
+            if sub_idx == 0:
+                ax.legend(fontsize=7, framealpha=0.85, loc="upper left")
+
+        for sub_idx in range(n_sub, n_rows * N_COLS):
+            row, col = divmod(sub_idx, N_COLS)
+            axes_qq[row][col].set_visible(False)
+
+        fig_qq.tight_layout()
+        _save_or_show(fig_qq, sp, fig_label)
+
+    for indices, fig_label, sp in index_groups:
+        _draw_qq_figure(indices, fig_label, sp)
+
+    # =========================================================================
+    # 3. Stage-1 bipower score  (optional)
+    # =========================================================================
+    if show_stage1:
+        fig_s1, ax_s1 = plt.subplots(figsize=(9, 4), facecolor="white")
+        bpv_s    = jump_result["bpv_score"]
+        bpv_bins = np.linspace(0, 1, n_bins + 1)
+
+        ax_s1.hist(bpv_s[~jump_mask], bins=bpv_bins, color=C_CLEAN,
+                   alpha=ALPHA_H, label="Clean days", zorder=2,
+                   linewidth=0.3, edgecolor="white")
+        ax_s1.hist(bpv_s[ jump_mask], bins=bpv_bins, color=C_JUMP,
+                   alpha=0.75,    label="Jump days",  zorder=3,
+                   linewidth=0.3, edgecolor="white")
+        ax_s1.set_title("Stage 1 — Bipower sliding-window score per day",
+                        fontsize=11, fontweight="bold")
+        ax_s1.set_xlabel(
+            "Fraction of tenors with a Stage-1 jump cell", fontsize=9)
+        ax_s1.set_ylabel("Count", fontsize=9)
+        ax_s1.set_xlim(0, 1)
+        ax_s1.legend(fontsize=9, framealpha=0.85)
+        ax_s1.tick_params(labelsize=8)
+        _spine_clean(ax_s1)
+        fig_s1.tight_layout()
+        _save_or_show(fig_s1, save_path_stage1, "Stage-1 figure")
+
+    # =========================================================================
+    # 4. Stage-2 Mahalanobis D²  (optional)
+    # =========================================================================
+    if show_stage2:
+        fig_s2, ax_s2 = plt.subplots(figsize=(9, 4), facecolor="white")
+        d2      = jump_result["mahal_d2"]
+        chi2_th = jump_result["chi2_threshold"]
+
+        d2_cap = max(
+            chi2_th * 4.0,
+            np.percentile(d2[~jump_mask], 99) * 1.5
+            if (~jump_mask).any() else chi2_th * 4.0,
+        )
+        d2_disp    = np.clip(d2, 0, d2_cap)
+        d2_bins    = np.linspace(0, d2_cap, n_bins + 1)
+        n_offscale = int((d2 > d2_cap).sum())
+        bw_d2      = d2_bins[1] - d2_bins[0]
+
+        ax_s2.hist(d2_disp[~jump_mask], bins=d2_bins, color=C_CLEAN,
+                   alpha=ALPHA_H, label="Clean days", zorder=2,
+                   linewidth=0.3, edgecolor="white")
+        ax_s2.hist(d2_disp[ jump_mask], bins=d2_bins, color=C_JUMP,
+                   alpha=0.75,    label="Jump days",  zorder=3,
+                   linewidth=0.3, edgecolor="white")
+        ax_s2.axvline(chi2_th, color=C_THRSH, lw=2.0, ls="--", zorder=5,
+                      label=f"$\\chi^2_{{0.999}}$({n_tens}) = {chi2_th:.1f}")
+
+        x_chi2 = np.linspace(max(0.1, n_tens * 0.3), d2_cap, 400)
+        ax_s2.plot(x_chi2, _chi2.pdf(x_chi2, df=n_tens) * T * bw_d2,
+                   color=C_CHI2, lw=1.8, ls="-", zorder=4,
+                   label=f"$\\chi^2$({n_tens}) reference")
+
+        if n_offscale > 0:
+            ax_s2.text(0.97, 0.91, f"+{n_offscale} obs off-scale →",
+                       transform=ax_s2.transAxes, ha="right", va="top",
+                       fontsize=8, color=C_JUMP)
+
+        ax_s2.set_title("Stage 2 — Mahalanobis $D^2$ per day",
+                        fontsize=11, fontweight="bold")
+        ax_s2.set_xlabel(
+            r"$D_t^2 = \Delta f(t)^\top\hat\Sigma^{-1}\Delta f(t)$",
+            fontsize=9)
+        ax_s2.set_ylabel("Count", fontsize=9)
+        ax_s2.legend(fontsize=9, framealpha=0.85)
+        ax_s2.tick_params(labelsize=8)
+        _spine_clean(ax_s2)
+        fig_s2.tight_layout()
+        _save_or_show(fig_s2, save_path_stage2, "Stage-2 figure")
 
 
 # =============================================================================
@@ -2290,17 +2381,24 @@ def run_pipeline(
             for fname in sorted(csv_paths):
                 print(f"    Saved: {fname}")
 
-        # Figure 1: four-panel jump diagnostic
-        diag_png = os.path.join(output_dir, f"{csv_prefix}_jump_diagnostic.png")
+        # Figure 1: per-tenor histogram comparison + Q-Q + optional stage diagnostics
+        hist_base = os.path.join(output_dir, f"{csv_prefix}_hist")
+        qq_png    = os.path.join(output_dir, f"{csv_prefix}_qq.png")
+        s1_png    = os.path.join(output_dir, f"{csv_prefix}_stage1.png")
+        s2_png    = os.path.join(output_dir, f"{csv_prefix}_stage2.png")
         plot_jump_histograms(
-            delta_f              = delta_f,
-            jump_result          = jump_result,
-            fwd_tenors           = fwd_tenors,
-            representative_tenor = float(np.median(fwd_tenors)),
-            n_bins               = 60,
-            save_path            = diag_png,
+            delta_f          = delta_f,
+            jump_result      = jump_result,
+            fwd_tenors       = fwd_tenors,
+            n_bins           = 60,
+            save_path_hist   = hist_base,
+            save_path_qq     = qq_png,
+            save_path_stage1 = s1_png,
+            save_path_stage2 = s2_png,
         )
-        csv_paths[f"{csv_prefix}_jump_diagnostic.png"] = diag_png
+        csv_paths[f"{csv_prefix}_qq.png"]     = qq_png
+        csv_paths[f"{csv_prefix}_stage1.png"] = s1_png
+        csv_paths[f"{csv_prefix}_stage2.png"] = s2_png
 
         # Figure 2: per-tenor histogram grid
         tenor_png = os.path.join(output_dir, f"{csv_prefix}_tenor_histograms.png")
