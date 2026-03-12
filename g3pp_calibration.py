@@ -1,26 +1,29 @@
 """
-G5++ Gaussian HJM Swaption Calibration
+G3++ Gaussian HJM Swaption Calibration
 ========================================
-Implements the full calibration of the G5++ model to a USD SOFR ATM
+Implements the full calibration of the G3++ model to a USD SOFR ATM
 normal (Bachelier) swaption implied volatility matrix.
 
 Model:
     df(t,T) = alpha(t,T) dt + sum_k sigma_k exp(-kappa_k(T-t)) dW_k(t)
     r(t)    = sum_k x_k(t) + phi(t)
     dx_k    = -kappa_k x_k dt + sigma_k dW_k,  x_k(0) = 0
-    dW_k dW_l = rho_kl dt
+    dW_k dW_l = rho_kl dt,  k,l = 1,2,3
 
 Correlation modes:
-    'exponential'  rho_kl = exp(-beta*|k-l|), beta calibrated.  11 parameters.
-    'pca'          rho_kl from PCA of historical delta_f (data-driven, no
-                   exponential-decay assumption on tenor correlations).  10 parameters.
-    'identity'     rho_kl = delta_kl.  10 parameters.
+    'exponential'  rho_kl = exp(-beta*|k-l|), beta calibrated.  7 parameters.
+    'pca'          rho_kl from covariance PCA identification bridge (Section 6.7).
+                   Data-driven, no exponential-decay assumption.  6 parameters.
+    'identity'     rho_kl = delta_kl.  6 parameters.
 
-Initialisation:
-    rho_kl  <- PCA of correlation matrix of cleaned historical forward rate changes
-    beta    <- moment-matched from adjacent PCA-implied rho_kl
-    kappa_k <- log-spaced grid [0.05, 3.0] yr^{-1}  (NOT from PCA)
-    sigma_k <- one inner NNLS pass at fixed kappa^{(0)}, rho^{(0)}
+Initialisation (G3++ identification bridge):
+    kappa_k <- OLS log-linear regression on covariance PCA eigenvector spatial decay
+    sigma_k <- diagonal of projected factor-space covariance M = (E'E)^{-1} E' Sigma E (E'E)^{-1}
+    rho_kl  <- off-diagonal of M, normalised; rolling-mean demeaning (window=21, ACT/360)
+    beta    <- scalar fit to rho_kl = exp(-beta*|k-l|)
+
+Day count convention:
+    ACT/360 (SOFR standard): dt = 1/360
 
 Bond price:
     P(t,T) = P(0,T)/P(0,t) * exp(-sum_k B_k(t,T)*x_k(t)
@@ -30,11 +33,12 @@ Required inputs
 ---------------
 P0              : callable  P(0, T) -> float  (or array-valued)
 market_vols_bps : dict  {(T_e, T_s): sigma_n_bps}  ATM normal vols in bps
-delta_f         : (T, n) ndarray  historical daily forward rate changes (for PCA rho)
+delta_f         : (T, n) ndarray  historical daily forward rate changes (for PCA init)
+pillar_tenors   : (n,) ndarray  tenor grid in years matching delta_f columns
 
 Usage example
 -------------
-    from g5pp_calibration import G5ppCalibrator
+    from g5pp_calibration import G3ppCalibrator
     import numpy as np
 
     def P(T):
@@ -47,7 +51,7 @@ Usage example
        (10, 1): 58.0,(10, 2): 61.0,(10, 5): 65.0,(10, 10): 62.0,
     }
 
-    calib = G5ppCalibrator(P, market_vols, delta=0.5)
+    calib = G3ppCalibrator(P, market_vols, delta=0.5)
     result = calib.calibrate()
     print(result)
 """
@@ -300,50 +304,54 @@ def jump_detection_summary(result: dict, dates=None) -> None:
 
 def pca_loading_correlation(
     delta_f: np.ndarray,
-    n_factors: int = 5,
+    pillar_tenors: np.ndarray,
+    n_factors: int = 3,
+    dt: float = 1.0 / 360,
     remove_jumps: bool = True,
     jump_kwargs: dict = None,
     verbose: bool = False,
 ) -> tuple:
     """
-    PCA-implied G5++ factor correlation matrix from historical forward rate changes.
+    G3++ parameter identification bridge from historical forward rate changes.
 
-    Procedure
-    ---------
-    1. Optional jump decomposition (remove_jumps=True):
-       Two-stage bipower + Mahalanobis winsorisation; all T rows retained
-       with jump components subtracted / winsorised in place.
-    2. PCA on the CORRELATION matrix R = D^{-1} Sigma_diff D^{-1},
-       where D = diag(sqrt(Sigma_diff[j,j])) are per-tenor daily vols.
-       PCA on R gives pure correlation shapes free of vol distortion.
-       PCA on Sigma_diff directly would tilt eigenvectors toward high-vol
-       tenors (typically short end), distorting the loading matrix.
-    3. Factor correlation rho is derived from the top-K correlation
-       eigenvectors V_{R,K} alone — no per-tenor vol scaling (D) and no
-       eigenvalue scaling (Lambda^{1/2}) are applied.  This keeps rho
-       purely in correlation space:
-         V_fac    = V_{R,K}[:K, :]          (K x K sub-block)
-         V_fac_rn = row-normalised V_fac    (unit diagonal)
-         rho      = V_fac_rn @ V_fac_rn.T  (K x K, unit diagonal)
+    Implements Section 6.7 of the companion paper, exactly matching the
+    procedure in sofr_fwd_pca.run_pca():
 
-    Note
-    ----
-    PCA identifies rho_kl only.  kappa_k and sigma_k are NOT identifiable
-    from PCA — use init_kappa_logspaced() and one inner NNLS pass.
+    1. Optional jump decomposition (remove_jumps=True): two-stage bipower +
+       Mahalanobis winsorisation; all T rows retained with jumps removed.
+    2. Rolling-mean demeaning (window=21, ACT/360): discard first 20 rows.
+    3. Covariance PCA on the trimmed, demeaned changes.
+    4. Estimate kappa_k by OLS log-linear regression on eigenvector spatial decay.
+    5. Build basis matrix E[j,k] = exp(-kappa_hat_k * tau_j).
+    6. Project: M = (E'E)^{-1} E' Sigma E (E'E)^{-1}.
+    7. Extract sigma_k = sqrt(M[k,k] / dt), rho_kl = M[k,l] / sqrt(M[k,k]*M[l,l]).
+    8. Fit beta: argmin_{b>0} sum_{k<l} (rho_kl - exp(-b*|k-l|))^2.
 
     Parameters
     ----------
-    delta_f     : (T, n) array  historical daily forward rate changes
-    n_factors   : int           PCA components to retain (default 5)
-    remove_jumps: bool          run jump decomposition before PCA (default True)
-    jump_kwargs : dict or None  override defaults in detect_jumps()
-    verbose     : bool          print jump summary (default False)
+    delta_f       : (T, n) array  historical daily forward rate changes (decimal)
+    pillar_tenors : (n,) array    tenor grid in years matching delta_f columns
+    n_factors     : int           G3++ factors K (default 3)
+    dt            : float         time step in years (default 1/360, ACT/360)
+    remove_jumps  : bool          run jump decomposition before PCA (default True)
+    jump_kwargs   : dict or None  override defaults in detect_jumps()
+    verbose       : bool          print jump summary (default False)
 
     Returns
     -------
-    rho         : (n_factors, n_factors) ndarray  PSD correlation matrix, unit diagonal
+    params      : dict with keys:
+                    kappa_hat    : (n_factors,)  OLS decay rates
+                    kappa_ols_r2 : (n_factors,)  R^2 of each log-linear fit
+                    sigma_from_M : (n_factors,)  sigma_k = sqrt(M[k,k]/dt)
+                    rho_from_M   : (n_factors, n_factors)  factor correlation matrix
+                    beta_hat     : float  scalar beta from exponential fit
+                    M_hat        : (n_factors, n_factors)  factor-space covariance
+                    E_matrix     : (n, n_factors)  basis matrix
+                    sigma_hat    : (n, n)  sample covariance Sigma_diff
+                    n_clean_days : int  T_trim used for Sigma estimation
     jump_result : dict or None  output of detect_jumps(), or None if skipped
     """
+    # ── 1. Jump cleaning ──────────────────────────────────────────────────
     jump_result = None
     if remove_jumps:
         kw = jump_kwargs or {}
@@ -354,66 +362,141 @@ def pca_loading_correlation(
     else:
         delta_f_clean = delta_f
 
+    taus = np.asarray(pillar_tenors, dtype=float)
     T, n = delta_f_clean.shape
+    win  = 21
 
-    # Sample covariance of cleaned changes
-    mu  = delta_f_clean.mean(axis=0)
-    X_c = delta_f_clean - mu
-    Sigma = X_c.T @ X_c / (T - 1)
+    # ── 2. Rolling-mean demeaning, discard first (win-1) rows ─────────────
+    cs      = np.cumsum(delta_f_clean, axis=0)
+    mu_full = np.empty_like(delta_f_clean)
+    mu_full[:win] = cs[:win] / np.arange(1, win + 1)[:, np.newaxis]
+    mu_full[win:] = (cs[win:] - cs[:-win]) / win
 
-    # Per-tenor vols and correlation matrix R = D^{-1} Sigma D^{-1}
-    tenor_vols = np.sqrt(np.diag(Sigma))
-    D_inv = np.diag(1.0 / np.where(tenor_vols > 0, tenor_vols, 1.0))
-    R = D_inv @ Sigma @ D_inv
-    np.fill_diagonal(R, 1.0)
+    delta_trim = delta_f_clean[win - 1:]
+    mu_trim    = mu_full[win - 1:]
+    T_trim     = delta_trim.shape[0]
 
-    # Eigendecompose R (eigh returns ascending order; reverse to descending)
-    _, eigenvectors = eigh(R)
-    eigenvectors = eigenvectors[:, ::-1][:, :n_factors]   # (n, K)
+    X_c   = delta_trim - mu_trim
+    Sigma = X_c.T @ X_c / (T_trim - 1)
 
-    # Factor sub-block: first K rows of V_{R,K} — pure correlation space
-    V_fac     = eigenvectors[:n_factors, :]               # (K, K)
-    row_norms = np.sqrt(np.sum(V_fac ** 2, axis=1, keepdims=True))
-    row_norms = np.where(row_norms < 1e-12, 1.0, row_norms)
-    V_fac_rn  = V_fac / row_norms
+    # ── 3. Covariance PCA ─────────────────────────────────────────────────
+    eigenvalues, eigenvectors = eigh(Sigma)           # ascending
+    eigenvectors = eigenvectors[:, ::-1]              # descending
 
-    rho = V_fac_rn @ V_fac_rn.T
-    np.fill_diagonal(rho, 1.0)
+    # ── 4. kappa_k from OLS log-linear regression ─────────────────────────
+    kappa_hat = np.zeros(n_factors)
+    kappa_r2  = np.zeros(n_factors)
+    tau_c     = taus - taus.mean()
+    denom_tau = (tau_c ** 2).sum()
 
-    return rho, jump_result
+    for k in range(n_factors):
+        vk     = eigenvectors[:, k]
+        logv   = np.log(np.abs(vk).clip(1e-15))
+        logv_c = logv - logv.mean()
+        slope  = -(tau_c @ logv_c) / denom_tau
+        kappa_hat[k] = max(slope, 1e-4)
+        logv_fit = logv.mean() - kappa_hat[k] * tau_c
+        ss_res = ((logv - logv_fit) ** 2).sum()
+        ss_tot = ((logv - logv.mean()) ** 2).sum()
+        kappa_r2[k] = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    # ── 5. Basis matrix E[j,k] = exp(-kappa_hat_k * tau_j) ───────────────
+    E = np.exp(-kappa_hat[np.newaxis, :] * taus[:, np.newaxis])
+
+    # ── 6. Factor-space projection M = (E'E)^{-1} E' Sigma E (E'E)^{-1} ──
+    EtE = E.T @ E
+    try:
+        EtE_inv = np.linalg.inv(EtE)
+    except np.linalg.LinAlgError:
+        EtE_inv = np.linalg.pinv(EtE)
+    M_hat = EtE_inv @ (E.T @ Sigma @ E) @ EtE_inv
+
+    # ── 7. Extract sigma_k and rho_kl ─────────────────────────────────────
+    diag_M    = np.diag(M_hat).clip(0)
+    sigma_M   = np.sqrt(diag_M / dt)
+    denom_rho = np.sqrt(np.outer(diag_M, diag_M)).clip(1e-20)
+    rho_M     = M_hat / denom_rho
+    np.fill_diagonal(rho_M, 1.0)
+    rho_M     = np.clip(rho_M, -1.0, 1.0)
+
+    # ── 8. Fit scalar beta ────────────────────────────────────────────────
+    beta_hat = _fit_beta_from_rho(rho_M)
+
+    params = {
+        "kappa_hat":    kappa_hat,
+        "kappa_ols_r2": kappa_r2,
+        "sigma_from_M": sigma_M,
+        "rho_from_M":   rho_M,
+        "beta_hat":     beta_hat,
+        "M_hat":        M_hat,
+        "E_matrix":     E,
+        "sigma_hat":    Sigma,
+        "n_clean_days": T_trim,
+    }
+    return params, jump_result
+
+
+def _fit_beta_from_rho(rho: np.ndarray) -> float:
+    """
+    Fit scalar beta from rho[k,l] = exp(-beta*|k-l|) via golden-section search.
+    """
+    K = rho.shape[0]
+    pairs = [(k, l) for k in range(K) for l in range(k + 1, K)]
+    if not pairs:
+        return 0.3
+
+    def obj(b):
+        return sum((rho[k, l] - np.exp(-b * abs(k - l))) ** 2 for k, l in pairs)
+
+    b_grid  = np.linspace(1e-3, 15.0, 300)
+    b_best  = float(b_grid[np.argmin([obj(b) for b in b_grid])])
+    step    = b_grid[1] - b_grid[0]
+    lo, hi  = max(1e-4, b_best - step), min(20.0, b_best + step)
+    phi     = (np.sqrt(5) - 1) / 2
+    for _ in range(50):
+        b1, b2 = hi - phi * (hi - lo), lo + phi * (hi - lo)
+        if obj(b1) < obj(b2):
+            hi = b2
+        else:
+            lo = b1
+        if hi - lo < 1e-8:
+            break
+    return float((lo + hi) / 2)
 
 
 def correlation_matrix(
     beta: float = None,
-    n_factors: int = 5,
+    n_factors: int = 3,
     rho_mode: str = "exponential",
     delta_f: np.ndarray = None,
+    pillar_tenors: np.ndarray = None,
 ) -> np.ndarray:
     """
-    Correlation matrix for the G5++ Brownian motions.
+    Correlation matrix for the G3++ Brownian motions.
 
     Three modes:
 
     'exponential'  (default)
         rho_kl = exp(-beta * |k - l|),  beta > 0.  Guaranteed PSD.
-        Parameter vector: Theta in R^11.
+        Parameter vector: Theta in R^7  (3 kappas + 3 sigmas + 1 beta).
 
     'pca'
-        rho_kl = (L @ L.T)_kl  where L is the row-normalised PCA loading matrix.
-        dW_k = sum_j l_kj * d~W_j  (d~W_j independent, from PCA score directions).
-        Row-normalised so sum_j l_kj^2 = 1 => unit diagonal.
-        Requires delta_f. Parameter vector: Theta in R^10 (no beta).
+        rho_kl from the G3++ identification bridge (covariance PCA,
+        rolling-mean demeaning, factor-space projection).
+        Requires delta_f and pillar_tenors.
+        Parameter vector: Theta in R^6 (no beta).
 
     'identity'
-        rho_kl = delta_kl  (R = I_5).  Limiting / default fallback.
-        Parameter vector: Theta in R^10 (no beta).
+        rho_kl = delta_kl  (R = I_3).  Limiting / default fallback.
+        Parameter vector: Theta in R^6 (no beta).
 
     Parameters
     ----------
-    beta      : float or None   required for 'exponential'
-    n_factors : int             number of factors (default 5)
-    rho_mode  : str             'exponential', 'pca', or 'identity'
-    delta_f   : (T,n) array or None  required for 'pca'
+    beta          : float or None   required for 'exponential'
+    n_factors     : int             number of factors (default 3)
+    rho_mode      : str             'exponential', 'pca', or 'identity'
+    delta_f       : (T,n) array or None  required for 'pca'
+    pillar_tenors : (n,) array or None   required for 'pca'
 
     Returns
     -------
@@ -427,10 +510,14 @@ def correlation_matrix(
         idx = np.arange(n_factors)
         return np.exp(-beta * np.abs(idx[:, None] - idx[None, :]))
     elif rho_mode == "pca":
-        if delta_f is None:
-            raise ValueError("delta_f must be provided for rho_mode='pca'")
-        rho, _ = pca_loading_correlation(delta_f, n_factors)
-        return rho
+        if delta_f is None or pillar_tenors is None:
+            raise ValueError(
+                "delta_f and pillar_tenors must be provided for rho_mode='pca'"
+            )
+        params, _ = pca_loading_correlation(
+            delta_f, pillar_tenors, n_factors=n_factors
+        )
+        return params["rho_from_M"]
     else:
         raise ValueError(
             f"Unknown rho_mode '{rho_mode}'. "
@@ -471,12 +558,13 @@ def bond_price(
     float  bond price P(t, T)
     """
     tau = T - t
-    Bvec = np.array([B_k(kappas[k], tau) for k in range(5)])
+    K    = len(kappas)
+    Bvec = np.array([B_k(kappas[k], tau) for k in range(K)])
 
     # Variance correction: +0.5 * sum_{kl} rho_kl * sigma_k * sigma_l * Gamma_kl
     variance_correction = 0.0
-    for k in range(5):
-        for l in range(5):
+    for k in range(K):
+        for l in range(K):
             variance_correction += (
                 rho[k, l] * sigmas[k] * sigmas[l] * Gamma_kl(kappas[k], kappas[l], tau)
             )
@@ -558,8 +646,9 @@ def hedge_ratios(
     A0 = delta * np.sum(P0(payment_times))
     F0 = (P0(Te) - P0(Te + Ts)) / A0
 
-    h = np.zeros(5)
-    for k in range(5):
+    K = len(kappas)
+    h = np.zeros(K)
+    for k in range(K):
         # dN/dx_k = -B_k(0,Te)*P(0,Te) + B_k(0,Te+Ts)*P(0,Te+Ts)
         dN = -B_k(kappas[k], Te) * P0(Te) + B_k(kappas[k], Te + Ts) * P0(Te + Ts)
         # -F0 * dA/dx_k = F0 * sum_i delta_i * B_k(0,Te+Ti) * P(0,Te+Ti)
@@ -584,9 +673,10 @@ def model_normal_vol(
     P0: callable,
     rho_mode: str = "exponential",
     delta_f: np.ndarray = None,
+    pillar_tenors: np.ndarray = None,
 ) -> float:
     """
-    Closed-form G5++ normal (Bachelier) implied volatility.
+    Closed-form G3++ normal (Bachelier) implied volatility.
 
     sigma_n = sqrt(V_F / Te)
 
@@ -595,25 +685,28 @@ def model_normal_vol(
 
     Parameters
     ----------
-    Te, Ts   : floats  expiry and tenor in years
-    delta    : float   accrual fraction
-    sigmas   : (5,) array  vol parameters
-    kappas   : (5,) array  mean-reversion speeds
-    beta     : float or None  correlation decay (required for 'exponential')
-    P0       : callable
-    rho_mode : str  'exponential', 'pca', or 'identity'
-    delta_f  : (T,n) array or None  required when rho_mode='pca'
+    Te, Ts        : floats  expiry and tenor in years
+    delta         : float   accrual fraction
+    sigmas        : (K,) array  vol parameters
+    kappas        : (K,) array  mean-reversion speeds
+    beta          : float or None  correlation decay (required for 'exponential')
+    P0            : callable
+    rho_mode      : str  'exponential', 'pca', or 'identity'
+    delta_f       : (T,n) array or None  required when rho_mode='pca'
+    pillar_tenors : (n,) array or None   required when rho_mode='pca'
 
     Returns
     -------
     float  normal vol in ANNUAL units (multiply by 10000 for bps)
     """
-    rho = correlation_matrix(beta, rho_mode=rho_mode, delta_f=delta_f)
+    rho = correlation_matrix(beta, rho_mode=rho_mode, delta_f=delta_f,
+                             pillar_tenors=pillar_tenors)
     h = hedge_ratios(Te, Ts, delta, kappas, P0)
+    K = len(kappas)
 
     VF = 0.0
-    for k in range(5):
-        for l in range(5):
+    for k in range(K):
+        for l in range(K):
             ksum = kappas[k] + kappas[l]
             VF += (
                 rho[k, l]
@@ -680,29 +773,24 @@ def bachelier_price(
 # =============================================================================
 
 def init_kappa_logspaced(
-    n_factors: int = 5,
+    n_factors: int = 3,
     kappa_min: float = 0.05,
     kappa_max: float = 3.0,
 ) -> np.ndarray:
     """
-    Initialise G5++ decay rates kappa_k on a log-spaced grid.
+    Fallback G3++ decay rate initialisation on a log-spaced grid.
 
-    Rationale
-    ---------
-    kappa_k is NOT identifiable from PCA of the correlation matrix.
-    PCA identifies only rho_kl (via the row-normalised loading matrix).
-    sigma_k in turn requires knowing kappa_k first — the loading
-    sigma_k * exp(-kappa_k * tau) is not separable without kappa_k.
-    sigma_k is therefore obtained from one inner NNLS pass at fixed
-    kappa^{(0)} and rho^{(0)} (see inner_nnls).
+    Used when pca_loading_correlation() OLS R^2 values are too low to
+    trust the eigenvector regression.  The preferred initialisation is
+    kappa_hat from pca_loading_correlation().
 
     A log-spaced grid places one factor in each decay regime (level,
-    medium, curvature, ...) and gives the outer L-BFGS-B optimiser a
-    good basin of attraction without any model-specific assumption.
+    slope, curvature) and gives the outer L-BFGS-B optimiser a good
+    basin of attraction.  For K=3: kappa^{(0)} = (0.05, 0.39, 3.0) yr^{-1}.
 
     Parameters
     ----------
-    n_factors : int    number of factors K (default 5)
+    n_factors : int    number of factors K (default 3)
     kappa_min : float  slowest decay rate yr^{-1} (default 0.05)
     kappa_max : float  fastest decay rate yr^{-1} (default 3.0)
 
@@ -777,6 +865,7 @@ def inner_nnls(
     P0: callable,
     rho_mode: str = "exponential",
     delta_f: np.ndarray = None,
+    pillar_tenors: np.ndarray = None,
 ) -> tuple:
     """
     Inner NNLS loop: solve for non-negative sigmas given fixed kappas and beta.
@@ -793,7 +882,7 @@ def inner_nnls(
 
     Iterating: fix sigma^(old), linearise sigma_k = eps_k * sigma_k^(old),
     solve for eps_k >= 0 via NNLS.  Here we use a simpler approach:
-    build a (M x 5) design matrix A where A[m,k] captures the marginal
+    build a (M x K) design matrix A where A[m,k] captures the marginal
     contribution of sigma_k to sigma_n^model, and solve NNLS for sigmas.
 
     For each swaption m:
@@ -814,19 +903,21 @@ def inner_nnls(
     sigmas : (5,) array  non-negative solution
     residual : float  weighted RMSE in bps
     """
-    rho = correlation_matrix(beta, rho_mode=rho_mode, delta_f=delta_f)
-    M = len(swaption_grid)
+    rho = correlation_matrix(beta, rho_mode=rho_mode, delta_f=delta_f,
+                             pillar_tenors=pillar_tenors)
+    M_sw = len(swaption_grid)
+    K    = len(kappas)
 
     # Build linear design matrix using diagonal approximation
-    A_mat = np.zeros((M, 5))
-    b_vec = np.zeros(M)
+    A_mat = np.zeros((M_sw, K))
+    b_vec = np.zeros(M_sw)
 
     for m, (Te, Ts) in enumerate(swaption_grid):
         h = hedge_ratios(Te, Ts, delta, kappas, P0)
         w = np.sqrt(weights[(Te, Ts)])
         b_vec[m] = w * market_vols_bps[(Te, Ts)] * 1e-4  # convert bps -> annual
 
-        for k in range(5):
+        for k in range(K):
             C_kk = (1.0 - np.exp(-2.0 * kappas[k] * Te)) / (2.0 * kappas[k])
             A_mat[m, k] = w * np.abs(h[k]) * np.sqrt(C_kk / Te)
 
@@ -839,11 +930,11 @@ def inner_nnls(
         for Te, Ts in swaption_grid:
             sv = model_normal_vol(
                 Te, Ts, delta, sigmas, kappas, beta, P0,
-                rho_mode=rho_mode, delta_f=delta_f,
+                rho_mode=rho_mode, delta_f=delta_f, pillar_tenors=pillar_tenors,
             ) * 1e4
             diff = sv - market_vols_bps[(Te, Ts)]
             total += weights[(Te, Ts)] * diff ** 2
-        return np.sqrt(total / M)
+        return np.sqrt(total / M_sw)
 
     return sigmas_nnls, weighted_rmse(sigmas_nnls)
 
@@ -858,6 +949,8 @@ def calibration_objective(
     mu_reg: float = 1e-4,
     rho_mode: str = "exponential",
     delta_f: np.ndarray = None,
+    pillar_tenors: np.ndarray = None,
+    n_factors: int = 3,
 ) -> float:
     """
     Outer objective L(kappas, beta) = min_{sigmas>=0} weighted RMSE^2
@@ -868,9 +961,10 @@ def calibration_objective(
 
     Parameters
     ----------
-    theta    : (6,) array  [log(kappa_1),...,log(kappa_5), log(beta)]
-               or (5,) array  [log(kappa_1),...,log(kappa_5)]
+    theta    : (n_factors+1,) array  [log(kappa_1),...,log(kappa_K), log(beta)]
+               or (n_factors,) array  [log(kappa_1),...,log(kappa_K)]
                when rho_mode='identity'
+    n_factors: int   number of G3++ factors K (default 3)
     mu_reg   : float  regularisation weight on log(kappas)
     rho_mode : str    'exponential' or 'identity'
 
@@ -878,17 +972,17 @@ def calibration_objective(
     -------
     float  objective value
     """
-    kappas = np.exp(theta[:5])
+    kappas = np.exp(theta[:n_factors])
     kappas = np.clip(kappas, 1e-4, 10.0)
 
     if rho_mode == "exponential":
-        beta = np.clip(np.exp(theta[5]), 1e-4, 5.0)
+        beta = np.clip(np.exp(theta[n_factors]), 1e-4, 5.0)
     else:
         beta = None  # not used for identity
 
     sigmas, rmse = inner_nnls(
         kappas, beta, swaption_grid, market_vols_bps, weights, delta, P0,
-        rho_mode=rho_mode, delta_f=delta_f,
+        rho_mode=rho_mode, delta_f=delta_f, pillar_tenors=pillar_tenors,
     )
 
     # Regularisation: penalise very small or very large kappas
@@ -901,9 +995,9 @@ def calibration_objective(
 # Section 7 – Main calibrator class
 # =============================================================================
 
-class G5ppCalibrator:
+class G3ppCalibrator:
     """
-    Full G5++ calibration to a USD SOFR ATM normal swaption vol matrix.
+    Full G3++ calibration to a USD SOFR ATM normal swaption vol matrix.
 
     Parameters
     ----------
@@ -911,9 +1005,11 @@ class G5ppCalibrator:
     market_vols_bps : dict  {(Te, Ts): normal_vol_in_bps}
     delta           : float  accrual fraction (0.5 = semi-annual, 0.25 = quarterly)
     delta_f         : (T, n) ndarray or None  historical fwd rate changes for PCA init
-    tenor_grid_pca  : (n,) ndarray or None    tenor values matching delta_f columns
-    kappas0         : (5,) ndarray or None    manual initial kappas (overrides PCA)
+    pillar_tenors   : (n,) ndarray or None    tenor values matching delta_f columns
+    kappas0         : (3,) ndarray or None    manual initial kappas (overrides PCA)
     mu_reg          : float  regularisation weight (default 1e-4)
+    rho_mode        : str   'exponential', 'pca', or 'identity'
+    n_factors       : int   number of G3++ factors (default 3)
     """
 
     def __init__(
@@ -922,43 +1018,73 @@ class G5ppCalibrator:
         market_vols_bps: dict,
         delta: float = 0.5,
         delta_f: np.ndarray = None,
-        tenor_grid_pca: np.ndarray = None,
+        pillar_tenors: np.ndarray = None,
         kappas0: np.ndarray = None,
         mu_reg: float = 1e-4,
         rho_mode: str = "exponential",
+        n_factors: int = 3,
     ):
         """
         rho_mode : str
-            'exponential'  rho_kl = exp(-beta*|k-l|), beta calibrated. R^11.
-            'pca'          rho_kl = (L@L.T)_kl, L = row-normalised loading
-                           matrix from PCA of delta_f. Requires delta_f.
-                           dW_k = sum_j l_kj * d~W_j (independent PCA BWs).
-                           Row-normalised: sum_j l_kj^2=1. R^10 (no beta).
-            'identity'     rho_kl = delta_kl. Fallback. R^10 (no beta).
+            'exponential'  rho_kl = exp(-beta*|k-l|), beta calibrated. R^7.
+            'pca'          rho_kl from covariance PCA identification bridge
+                           (Section 6.7).  Requires delta_f and pillar_tenors.
+                           R^6 (no beta).
+            'identity'     rho_kl = delta_kl. Fallback. R^6 (no beta).
         """
         self.P0 = P0
         self.market_vols_bps = market_vols_bps
         self.delta = delta
         self.delta_f = delta_f
-        self.tenor_grid_pca = tenor_grid_pca
+        self.pillar_tenors = pillar_tenors
         self.kappas0_manual = kappas0
         self.mu_reg = mu_reg
         self.rho_mode = rho_mode
+        self.n_factors = n_factors
         self.swaption_grid = sorted(market_vols_bps.keys())
 
     # ------------------------------------------------------------------
-    def _initialise_kappas(self) -> np.ndarray:
+    def _initialise_kappas(self) -> tuple:
         """
-        Initialise kappas via log-spaced grid.
-        kappa_k is NOT identifiable from PCA — use a fixed grid.
-        Manual override via kappas0 constructor argument.
+        Initialise kappas and sigmas from the G3++ identification bridge.
+
+        Primary: kappa from OLS eigenvector regression (pca_loading_correlation).
+        Fallback: log-spaced grid when OLS R^2 < 0.5 for any factor.
+        Manual override: kappas0 constructor argument.
+
+        Returns
+        -------
+        kappas0 : (n_factors,) array
+        sigma0  : (n_factors,) array or None
+        beta0   : float
         """
+        K = self.n_factors
+
         if self.kappas0_manual is not None:
             print("Using manually supplied kappa initialisation.")
-            return np.asarray(self.kappas0_manual, dtype=float)
-        kappas0 = init_kappa_logspaced()
-        print(f"kappa^{{(0)}} = {kappas0.round(4)}  (log-spaced grid)")
-        return kappas0
+            return np.asarray(self.kappas0_manual, dtype=float), None, 0.3
+
+        if self.delta_f is not None and self.pillar_tenors is not None:
+            params, _ = pca_loading_correlation(
+                self.delta_f, self.pillar_tenors, n_factors=K, verbose=False,
+            )
+            if params["kappa_ols_r2"].min() >= 0.5:
+                kappas0 = params["kappa_hat"].copy()
+                print(f"kappa^{{(0)}} = {kappas0.round(4)}  (OLS eigenvector regression, "
+                      f"R² = {params['kappa_ols_r2'].round(3)})")
+            else:
+                kappas0 = init_kappa_logspaced(K)
+                print(f"kappa^{{(0)}} = {kappas0.round(4)}  (log-spaced fallback, "
+                      f"low OLS R² = {params['kappa_ols_r2'].round(3)})")
+            sigma0 = params["sigma_from_M"]
+            beta0  = params["beta_hat"]
+            print(f"sigma^{{(0)}} = {(sigma0 * 1e4).round(2)} bps/sqrt(yr)  (from M projection)")
+            print(f"beta^{{(0)}}  = {beta0:.4f}  (fit to rho_kl = exp(-beta*|k-l|))")
+            return kappas0, sigma0, beta0
+
+        kappas0 = init_kappa_logspaced(K)
+        print(f"kappa^{{(0)}} = {kappas0.round(4)}  (log-spaced grid, no delta_f supplied)")
+        return kappas0, None, 0.3
 
     # ------------------------------------------------------------------
     def calibrate(
@@ -988,32 +1114,22 @@ class G5ppCalibrator:
             rmse_bps, max_error_bps,
             success
         """
+        K = self.n_factors
+
         # Compute vega weights once
         weights = vega_weights(self.swaption_grid, self.delta, self.P0)
 
-        # Initialise kappas and beta
-        kappas0 = self._initialise_kappas()
+        # Initialise kappas, sigma0, beta0 from identification bridge
+        kappas0, sigma0, beta0 = self._initialise_kappas()
 
-        # beta0: moment-match to PCA-implied correlation if available,
-        # else use default 0.3
-        if self.delta_f is not None and self.rho_mode == "exponential":
-            rho_pca, _ = pca_loading_correlation(self.delta_f, remove_jumps=True)
-            beta0 = init_beta_from_rho(rho_pca)
-            print(f"beta^{{(0)}} = {beta0:.4f}  (moment-matched from PCA rho)")
-        else:
-            beta0 = 0.3
-
-        # Bounds in log-space
-        # kappa in [1e-4, 10]; beta in [1e-4, 5] only for exponential mode
+        # Bounds in log-space: kappa in [1e-4, 10]; beta in [1e-4, 5]
         if self.rho_mode == "exponential":
             bounds_lbfgs = (
-                [(np.log(1e-4), np.log(10.0))] * 5
+                [(np.log(1e-4), np.log(10.0))] * K
                 + [(np.log(1e-4), np.log(5.0))]
             )
-            theta_dim = 6
-        else:  # identity: no beta parameter
-            bounds_lbfgs = [(np.log(1e-4), np.log(10.0))] * 5
-            theta_dim = 5
+        else:  # identity / pca: no beta parameter in theta
+            bounds_lbfgs = [(np.log(1e-4), np.log(10.0))] * K
 
         best_result = None
         best_obj    = np.inf
@@ -1025,7 +1141,7 @@ class G5ppCalibrator:
                 kappas_init = kappas0.copy()
             else:
                 # Perturb in log-space
-                noise = rng.uniform(-0.5, 0.5, size=5)
+                noise = rng.uniform(-0.5, 0.5, size=K)
                 kappas_init = kappas0 * np.exp(noise)
                 kappas_init = np.clip(kappas_init, 1e-4, 10.0)
 
@@ -1051,6 +1167,8 @@ class G5ppCalibrator:
                         self.mu_reg,
                         self.rho_mode,
                         self.delta_f,
+                        self.pillar_tenors,
+                        K,
                     ),
                     method="L-BFGS-B",
                     bounds=bounds_lbfgs,
@@ -1070,11 +1188,11 @@ class G5ppCalibrator:
 
         # Extract final parameters
         theta_opt  = best_result.x
-        kappas_opt = np.clip(np.exp(theta_opt[:5]), 1e-4, 10.0)
+        kappas_opt = np.clip(np.exp(theta_opt[:K]), 1e-4, 10.0)
         if self.rho_mode == "exponential":
-            beta_opt = np.clip(np.exp(theta_opt[5]), 1e-4, 5.0)
+            beta_opt = np.clip(np.exp(theta_opt[K]), 1e-4, 5.0)
         else:
-            beta_opt = None  # not used for identity mode
+            beta_opt = None
 
         # Final NNLS pass for sigmas
         sigmas_opt, _ = inner_nnls(
@@ -1082,25 +1200,28 @@ class G5ppCalibrator:
             self.swaption_grid, self.market_vols_bps,
             weights, self.delta, self.P0,
             rho_mode=self.rho_mode, delta_f=self.delta_f,
+            pillar_tenors=self.pillar_tenors,
         )
 
         # Compute fit quality
-        fitted_vols  = {}
-        errors       = {}
+        fitted_vols = {}
+        errors      = {}
         for (Te, Ts) in self.swaption_grid:
             sv = model_normal_vol(
                 Te, Ts, self.delta, sigmas_opt, kappas_opt, beta_opt, self.P0,
                 rho_mode=self.rho_mode, delta_f=self.delta_f,
+                pillar_tenors=self.pillar_tenors,
             ) * 1e4
             fitted_vols[(Te, Ts)] = sv
-            errors[(Te, Ts)] = sv - self.market_vols_bps[(Te, Ts)]
+            errors[(Te, Ts)]      = sv - self.market_vols_bps[(Te, Ts)]
 
         err_arr   = np.array(list(errors.values()))
         rmse_bps  = np.sqrt(np.mean(err_arr ** 2))
         max_error = np.max(np.abs(err_arr))
 
         rho = correlation_matrix(
-            beta_opt, rho_mode=self.rho_mode, delta_f=self.delta_f
+            beta_opt, rho_mode=self.rho_mode, delta_f=self.delta_f,
+            pillar_tenors=self.pillar_tenors,
         )
         result = {
             "sigmas":           sigmas_opt,
@@ -1116,6 +1237,7 @@ class G5ppCalibrator:
             "success":          best_result.success,
             "n_swaptions":      len(self.swaption_grid),
             "delta_f":          self.delta_f,
+            "pillar_tenors":    self.pillar_tenors,
         }
 
         if verbose:
@@ -1126,7 +1248,7 @@ class G5ppCalibrator:
     # ------------------------------------------------------------------
     def _print_summary(self, result: dict):
         print("\n" + "=" * 60)
-        print("G5++ CALIBRATION RESULTS")
+        print("G3++ CALIBRATION RESULTS")
         print("=" * 60)
         print(f"  sigmas : {result['sigmas'].round(6)}")
         print(f"  kappas : {result['kappas'].round(4)}")
@@ -1166,7 +1288,7 @@ def price_swaption(
     ----------
     Te, Ts      : expiry and tenor
     K           : strike rate (use None for ATM)
-    result      : calibration result dict from G5ppCalibrator.calibrate()
+    result      : calibration result dict from G3ppCalibrator.calibrate()
     delta       : accrual fraction
     P0          : discount curve
     option_type : 'payer' or 'receiver'
@@ -1175,18 +1297,20 @@ def price_swaption(
     -------
     dict with keys: F0, K, sigma_n_bps, price, A0
     """
-    sigmas   = result['sigmas']
-    kappas   = result['kappas']
-    beta     = result['beta']
-    rho_mode = result.get('rho_mode', 'exponential')
+    sigmas        = result['sigmas']
+    kappas        = result['kappas']
+    beta          = result['beta']
+    rho_mode      = result.get('rho_mode', 'exponential')
+    delta_f       = result.get('delta_f', None)
+    pillar_tenors = result.get('pillar_tenors', None)
 
     F0 = forward_swap_rate(Te, Ts, delta, P0)
     if K is None:
         K = F0
 
-    delta_f  = result.get('delta_f', None)
     sigma_n = model_normal_vol(Te, Ts, delta, sigmas, kappas, beta, P0,
-                               rho_mode=rho_mode, delta_f=delta_f)
+                               rho_mode=rho_mode, delta_f=delta_f,
+                               pillar_tenors=pillar_tenors)
 
     price   = bachelier_price(F0, K, Te, Ts, delta, sigma_n, P0, option_type)
     A0      = annuity(Te, Ts, delta, P0)
@@ -1223,18 +1347,20 @@ def vol_matrix(
     -------
     vols : (len(expiries), len(tenors)) array  in bps
     """
-    sigmas   = result['sigmas']
-    kappas   = result['kappas']
-    beta     = result['beta']
-    rho_mode = result.get('rho_mode', 'exponential')
+    sigmas        = result['sigmas']
+    kappas        = result['kappas']
+    beta          = result['beta']
+    rho_mode      = result.get('rho_mode', 'exponential')
+    delta_f       = result.get('delta_f', None)
+    pillar_tenors = result.get('pillar_tenors', None)
 
-    delta_f  = result.get('delta_f', None)
     vols = np.zeros((len(expiries), len(tenors)))
     for i, Te in enumerate(expiries):
         for j, Ts in enumerate(tenors):
             vols[i, j] = model_normal_vol(
                 Te, Ts, delta, sigmas, kappas, beta, P0,
                 rho_mode=rho_mode, delta_f=delta_f,
+                pillar_tenors=pillar_tenors,
             ) * 1e4
     return vols
 
@@ -1244,7 +1370,7 @@ def vol_matrix(
 # =============================================================================
 
 if __name__ == "__main__":
-    print("Running G5++ self-test with flat 5% discount curve...\n")
+    print("Running G3++ self-test with flat 5% discount curve...\n")
 
     def P0_flat(T):
         return np.exp(-0.05 * np.asarray(T, dtype=float))
@@ -1256,7 +1382,7 @@ if __name__ == "__main__":
         (10, 1): 58.0, (10, 2): 61.0, (10, 5): 65.0, (10,10): 62.0,
     }
 
-    calib = G5ppCalibrator(
+    calib = G3ppCalibrator(
         P0=P0_flat,
         market_vols_bps=market_vols,
         delta=0.5,
@@ -1280,36 +1406,42 @@ if __name__ == "__main__":
         row = f"  {Te:4.0f}Y  " + "  ".join(f"{V[i,j]:6.2f}" for j in range(len(tenors)))
         print(row)
 
-    print("\n--- Testing rho_mode='pca' (loading matrix correlation) ---")
-    # Synthetic historical data: 500 days x 40 tenors
+    print("\n--- Testing rho_mode='pca' (identification bridge) ---")
+    # Synthetic historical data: 500 days x 20 tenors, dt = 1/360 (ACT/360)
     rng2 = np.random.default_rng(0)
-    synthetic_df = rng2.standard_normal((500, 40)) * 5e-4
-    tenor_grid   = np.linspace(1/12, 30, 40)
-    calib_pca = G5ppCalibrator(
+    synthetic_df = rng2.standard_normal((500, 20)) * 5e-4
+    tenor_grid   = np.linspace(1/12, 30, 20)
+    calib_pca = G3ppCalibrator(
         P0=P0_flat,
         market_vols_bps=market_vols,
         delta=0.5,
         delta_f=synthetic_df,
-        tenor_grid_pca=tenor_grid,
+        pillar_tenors=tenor_grid,
         rho_mode="pca",
     )
     result_pca = calib_pca.calibrate(n_restarts=2, verbose=True)
-    rho_pca, jres = pca_loading_correlation(synthetic_df, verbose=True)
-    print(f"PCA correlation matrix (top-left 3x3):\n{result_pca['rho'][:3,:3].round(3)}")
+    params, jres = pca_loading_correlation(synthetic_df, tenor_grid, verbose=True)
+    print(f"PCA rho (3x3):\n{params['rho_from_M'].round(3)}")
+    print(f"kappa_hat = {params['kappa_hat'].round(4)},  R² = {params['kappa_ols_r2'].round(3)}")
+    print(f"sigma_hat = {(params['sigma_from_M']*1e4).round(2)} bps/sqrt(yr)")
+    print(f"beta_hat  = {params['beta_hat']:.4f}")
     if jres is not None:
         print(f"Jump days detected: {jres['n_jumps']} "
               f"({100*jres['jump_fraction']:.1f}% of sample)")
     print()
 
     print("--- Demonstrating detect_jumps standalone ---")
-    # Inject 10 artificial jump days into synthetic data
     rng3 = np.random.default_rng(42)
     synthetic_with_jumps = synthetic_df.copy()
     jump_days_true = rng3.choice(500, size=10, replace=False)
-    synthetic_with_jumps[jump_days_true] += rng3.standard_normal((10, 40)) * 5e-3
-    jresult = detect_jumps(synthetic_with_jumps, c_mad=4.0, alpha=0.001, n_iter=3)
+    synthetic_with_jumps[jump_days_true] += rng3.standard_normal((10, 20)) * 5e-3
+    jresult = detect_jumps(synthetic_with_jumps)
     jump_detection_summary(jresult)
     recovered = np.intersect1d(jresult["jump_idx"], jump_days_true)
     print(f"True jump days injected : {len(jump_days_true)}")
     print(f"Detected correctly      : {len(recovered)}")
     print()
+
+# Backward-compatibility alias
+G5ppCalibrator = G3ppCalibrator
+

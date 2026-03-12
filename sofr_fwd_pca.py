@@ -1,8 +1,8 @@
 """
-SOFR Forward Rate PCA Correlation Calibration
-==============================================
+SOFR Forward Rate PCA Calibration — G3++ Parameter Identification
+=================================================================
 Full pipeline: zero rates -> instantaneous forward rates -> jump decomposition
--> PCA on correlation matrix -> G5++ factor correlation matrix.
+-> PCA on COVARIANCE matrix -> G3++ parameter identification bridge.
 
 Pipeline steps
 --------------
@@ -18,10 +18,14 @@ Pipeline steps
        Stage 2 : iterative Mahalanobis winsorisation (Huber M-estimator)
                  Multivariate outlier days shrunk radially to chi^2 ellipsoid;
                  all T rows retained with winsorised values.
-  4. PCA on the CORRELATION matrix R = D^{-1} Sigma_diff D^{-1} of the
-     Stage-1+2 cleaned changes (all T rows).
-  5. Loading matrix L = D V_{R,K} Lambda_{R,K}^{1/2} and G5++ factor
-     correlation rho = L_fac_rn @ L_fac_rn.T (row-normalised, unit diagonal).
+  4. PCA on the COVARIANCE matrix Sigma_diff of Stage-1+2 cleaned changes
+     (all T rows, K=3 components retained by default).
+  5. G3++ parameter identification bridge (Section 6.7 of companion paper):
+       - kappa_k  <- log-linear OLS regression on eigenvector spatial decay
+       - M        <- factor-space covariance projection M = (E'E)^{-1} E' Sigma E (E'E)^{-1}
+       - sigma_k  <- sqrt(M_kk / dt)
+       - rho_kl   <- M_kl / sqrt(M_kk * M_ll)
+       - beta     <- scalar fit to rho_kl = exp(-beta * |k-l|)
 
 Mathematical background
 -----------------------
@@ -48,24 +52,33 @@ Jump decomposition
         Y_t  <- mu + (Y_t - mu) * s_t   (winsorised in place)
         Iterate until flagged set converges (typically 2-3 passes).
 
-PCA and loading matrix
-    Run PCA on the CORRELATION matrix R = D^{-1} Sigma_diff D^{-1}
-    (not the covariance Sigma_diff directly) so that eigenvectors
-    reflect pure correlation shapes free of per-tenor vol distortion.
-    Loading matrix:  L = D V_{R,K} Lambda_{R,K}^{1/2}   (n x K)
-      so that  L L^T ~= Sigma_diff  (K-factor approximation).
-    Factor correlation:
-      L_fac = L[:K, :]  (K x K factor sub-block)
-      L_fac_rn = row-normalised L_fac
-      rho = L_fac_rn @ L_fac_rn.T  (unit diagonal guaranteed)
-    Note: PCA identifies rho_kl only.  kappa_k is not identifiable
-    from PCA; use init_kappa_logspaced() for a log-spaced starting grid.
+PCA and G3++ parameter identification (Section 6.7)
+    PCA is performed on the COVARIANCE matrix Sigma_diff (not the correlation
+    matrix) with K=3 components retained.  This keeps absolute volatility
+    magnitudes in the eigenvectors, which are needed for sigma_k identification.
 
-Initialisation summary (for G5++ calibration)
-    rho_kl  <- from PCA of R (this module)
-    beta    <- moment-matched to adjacent rho_kl via e^{-beta} = mean(rho_{k,k+1})
-    kappa_k <- log-spaced grid [kappa_min, kappa_max] (init_kappa_logspaced)
-    sigma_k <- one inner NNLS pass at fixed kappa^{(0)}, rho^{(0)} (in g5pp_calibration.py)
+    Step 1 — kappa_k from eigenvector spatial decay (OLS log-linear):
+        log|v_k(tau_j)| = a_k - kappa_k * tau_j + eps_j
+        kappa_hat_k = -slope from OLS regression over the tenor grid.
+
+    Step 2 — Build basis matrix E  (n x K):
+        E[j, k] = exp(-kappa_hat_k * tau_j)
+
+    Step 3 — Factor-space covariance projection:
+        M = (E'E)^{-1} E' Sigma_diff E (E'E)^{-1}   (K x K)
+        This is the normal-equation solution to  min ||Sigma - E M E'||_F^2.
+
+    Step 4 — Extract G3++ parameters:
+        sigma_k  = sqrt(M[k,k] / dt)
+        rho_kl   = M[k,l] / sqrt(M[k,k] * M[l,l])
+        beta     = argmin_b sum_{k<l} (rho_kl - exp(-b*|k-l|))^2
+
+Initialisation summary (for G3++ calibration)
+    kappa_k <- OLS regression on covariance PCA eigenvector shapes
+    sigma_k <- diagonal of projected factor-space covariance M
+    rho_kl  <- off-diagonal of M, normalised
+    beta    <- scalar fit to exponential correlation model
+    All four are used directly as Theta^{(0)} for the swaption calibration.
 
 Usage
 -----
@@ -80,13 +93,15 @@ With real data:
         pillar_tenors = my_tenors,       # (n_pillars,) in years
     )
     # Key outputs:
-    print(result['rho'].round(3))               # (5x5) G5++ factor correlation
-    print(result['kappa0'])                      # (5,) log-spaced kappa initialisation
-    print(result['beta0'])                       # scalar beta initialisation
-    print(result['jump_result']['n_stage1_days']) # Stage-1 cells adjusted
-    print(result['jump_result']['n_stage2_days']) # Stage-2 days winsorised
+    print(result['kappa0'])    # (3,) kappa initialisation from eigenvector regression
+    print(result['sigma0'])    # (3,) sigma initialisation from factor-space covariance
+    print(result['rho'])       # (3,3) G3++ factor correlation matrix
+    print(result['beta0'])     # scalar beta initialisation
+    print(result['M_hat'])     # (3,3) projected factor-space covariance
+    print(result['jump_result']['n_stage1_days'])  # Stage-1 cells adjusted
+    print(result['jump_result']['n_stage2_days'])  # Stage-2 days winsorised
 
-Author: generated alongside G5++ Gaussian HJM Swaption Paper
+Author: generated alongside G3++ Gaussian HJM Swaption Paper
 """
 
 from __future__ import annotations
@@ -1240,95 +1255,196 @@ def print_jump_summary(result: dict, dates=None) -> None:
 
 
 # =============================================================================
-# Section 4 — PCA and Loading-Matrix Correlation
+# =============================================================================
+# Section 4 — PCA and G3++ Parameter Identification Bridge
 # =============================================================================
 
 def run_pca(
     delta_f_clean: np.ndarray,
-    n_factors: int = 5,
+    pillar_tenors: np.ndarray,
+    n_factors: int = 3,
+    dt: float = 1.0 / 360,
 ) -> dict:
     """
-    PCA on the CORRELATION matrix of jump-cleaned daily forward rate changes.
+    PCA on the COVARIANCE matrix of jump-cleaned daily forward rate changes,
+    followed by the G3++ parameter identification bridge (Section 6.7 of the
+    companion paper).
 
-    Rationale
-    ---------
-    PCA on the covariance matrix Sigma_diff conflates volatility levels with
-    correlation structure: tenors with higher daily volatility dominate the
-    eigenvectors, so the level PC tilts toward high-vol tenors rather than
-    reflecting a pure parallel shift.  PCA on the correlation matrix R
-    separates the two:
+    Why covariance (not correlation)?
+    ----------------------------------
+    The G3++ model predicts Sigma = E M E^T where E[j,k] = exp(-kappa_k * tau_j)
+    and M[k,l] = rho_kl * sigma_k * sigma_l * dt.  Eigenvectors of Sigma carry
+    both shape (kappa_k via decay rate) and amplitude (sigma_k via scale)
+    information.  Dividing by per-tenor volatilities before PCA (i.e. using the
+    correlation matrix) strips the amplitude information and prevents recovering
+    sigma_k from the projection formula.  The covariance eigenvectors retain both.
 
-      - Eigenvectors of R  --> pure correlation shapes (level / slope /
-        curvature), free of per-tenor volatility distortion.
-      - Per-tenor volatilities sigma_j = sqrt(Sigma_diff[j,j])
-        are re-introduced when forming the G5++ loading matrix L
-        (see build_loading_correlation).
+    Identification steps (Section 6.7)
+    ------------------------------------
+    1.  Compute rolling mean mu[t] = mean of delta_f_clean[t-20 : t+1, :]
+        over a window of 21 rows.  Discard the first 20 rows (window=21 warm-up),
+        leaving T_trim = T - 20 effective observations.
+        Demean: X_c[t] = delta_f_clean[t+20] - mu[t+20]  for t = 0 .. T_trim-1.
+    2.  Covariance:  Sigma = X_c^T X_c / (T_trim - 1).
+    3.  Eigen-decompose Sigma = V Lambda V^T  (descending order).
+    4.  Estimate kappa_k by OLS log-linear regression of log|v_k(tau_j)|
+        on tenor tau_j  =>  kappa_hat_k.
+    5.  Build basis matrix E[j,k] = exp(-kappa_hat_k * tau_j).
+    6.  Project covariance into factor space:
+            M = (E'E)^{-1} E' Sigma_diff E (E'E)^{-1}
+        This is the unique minimiser of ||Sigma_diff - E M E'||_F^2.
+    7.  Extract:
+            sigma_k  = sqrt(M[k,k] / dt)
+            rho_kl   = M[k,l] / sqrt(M[k,k] * M[l,l])
+    8.  Fit scalar beta by minimising sum_{k<l} (rho_kl - exp(-beta*|k-l|))^2.
 
-    Note: the decay rates kappa_k are NOT identifiable from PCA.
-    PCA of R gives rho_kl (via the loading matrix) only.
-    kappa_k are initialised separately via a log-spaced grid
-    (see init_kappa_logspaced).  sigma_k are obtained from one
-    inner NNLS pass at fixed kappa^{(0)}, rho^{(0)}.
+    Rotation note (Section 6.7.5)
+    ------------------------------
+    PCA eigenvectors of Sigma are orthogonal; G3++ factors are correlated.
+    The matrix Sigma = E M E^T = E (S R S dt) E^T factors as:
 
-    Procedure
-    ---------
-    1. Estimate Sigma = Cov(delta_f_clean).
-    2. Form D = diag(sigma_1,...,sigma_n),  sigma_j = sqrt(Sigma[j,j]).
-    3. Compute correlation matrix  R = D^{-1} Sigma D^{-1}.
-    4. Eigendecompose R = V_R Lambda_R V_R^T  (all n components).
-    5. Return top-K eigenvectors V_{R,K} and eigenvalues Lambda_{R,K}.
+        Sigma = (EL)(EL)^T dt = E_tilde E_tilde^T dt
 
-    The G5++ loading matrix is then  L = D V_{R,K} Lambda_{R,K}^{1/2}
-    so that  L L^T ~= D R D = Sigma  (K-factor approximation).
+    where  L = S R^{1/2}  (NOT S^{1/2} R^{1/2})  and  E_tilde = E L.
+    Proof:  (S R^{1/2})(S R^{1/2})^T = S R^{1/2} R^{1/2} S = S R S  ✓
+    whereas (S^{1/2} R^{1/2})(S^{1/2} R^{1/2})^T = S^{1/2} R S^{1/2} ≠ S R S.
+
+    PCA eigenvectors are the left singular vectors of E_tilde, not of E.
+    The kappa regression on E (step 4) is therefore an approximation; use
+    compute_rotation_L() to construct L and apply the iterative correction.
 
     Parameters
     ----------
-    delta_f_clean : (T, n) ndarray   Stage-1+2 cleaned diffusive changes
-    n_factors     : int               number of components to retain (default 5)
+    delta_f_clean : (T, n) ndarray   Stage-1+2 cleaned diffusive changes (decimal)
+    pillar_tenors : (n,) ndarray     tenor grid in years (strictly ascending)
+    n_factors     : int              number of G3++ factors K (default 3)
+    dt            : float            time step in years (default 1/360, ACT/360 — SOFR convention)
 
     Returns
     -------
     dict with keys:
-        eigenvalues      : (n,) eigenvalue spectrum of R (descending)
-        eigenvectors     : (n, n) eigenvector matrix of R (columns)
-        explained_var    : (n,) fraction of variance per component (from R)
-        cumulative_var   : (n,) cumulative explained variance
-        top_eigenvalues  : (n_factors,) top-K eigenvalues of R
-        top_eigenvectors : (n, n_factors) top-K eigenvectors of R
-        scores           : (T, n_factors) factor scores X_c @ V_{R,K}
-        sigma_hat        : (n, n) sample covariance matrix Sigma_diff
-        corr_matrix      : (n, n) sample correlation matrix R
-        tenor_vols       : (n,) per-tenor daily volatility sqrt(Sigma[j,j])
+        # --- Covariance PCA ---
+        sigma_hat        : (n, n)         sample covariance matrix Sigma_diff
+        eigenvalues      : (n,)           eigenvalue spectrum of Sigma_diff (descending)
+        eigenvectors     : (n, n)         eigenvector matrix (columns, descending)
+        explained_var    : (n,)           fraction of total variance per component
+        cumulative_var   : (n,)           cumulative explained variance
+        top_eigenvalues  : (n_factors,)   top-K eigenvalues
+        top_eigenvectors : (n, n_factors) top-K eigenvectors
+        scores           : (T_trim, n_factors) PC scores X_c @ V_K
         n_factors        : int
-        n_clean_days     : int
+        n_clean_days     : int   T_trim = T - 20  (rows used after warm-up discard)
+        rolling_mean     : (T_trim, n)  rolling-mean matrix mu (window=21)
+        rolling_window   : int   window size (21)
+
+        # --- kappa identification (Step 2) ---
+        kappa_hat        : (n_factors,)   OLS decay rates from eigenvector regression
+        kappa_ols_r2     : (n_factors,)   R^2 of each log-linear fit (quality check)
+
+        # --- Basis matrix and projection (Steps 3-4) ---
+        E_matrix         : (n, n_factors) basis matrix E[j,k] = exp(-kappa_hat_k * tau_j)
+        M_hat            : (n_factors, n_factors) factor-space covariance matrix
+
+        # --- G3++ parameters (Steps 5-6) ---
+        sigma_from_M     : (n_factors,)   sigma_k = sqrt(M[k,k] / dt)
+        rho_from_M       : (n_factors, n_factors) rho_kl from off-diagonal of M
+        beta_hat         : float          scalar beta from exponential fit to rho_kl
     """
     T, n = delta_f_clean.shape
+    taus = np.asarray(pillar_tenors, dtype=float)
+    win  = 21                                                # rolling-mean window
 
-    # Step 1: sample covariance
-    mu    = delta_f_clean.mean(axis=0)
-    X_c   = delta_f_clean - mu
-    Sigma = X_c.T @ X_c / (T - 1)
+    # ------------------------------------------------------------------
+    # Step 1: covariance PCA with rolling-mean demeaning
+    # ------------------------------------------------------------------
+    # mu[t] = mean of delta_f_clean[t-win+1 : t+1, :]  (window of 21 rows).
+    # The first valid index is t = win-1 = 20 (needs rows 0..20).
+    # We discard the first (win-1) = 20 rows so that every retained row
+    # has a full window, giving T_trim = T - (win-1) effective observations.
+    #
+    # Implementation: cumulative sum trick for O(T*n) rolling mean.
+    cs   = np.cumsum(delta_f_clean, axis=0)                 # (T, n)
+    # mu_full[t] for t >= win-1: mean of rows t-win+1 .. t
+    mu_full = np.empty_like(delta_f_clean)
+    mu_full[:win] = cs[:win] / np.arange(1, win + 1)[:, np.newaxis]  # partial (unused)
+    mu_full[win:] = (cs[win:] - cs[:-win]) / win            # full windows
 
-    # Step 2: per-tenor volatilities and scaling matrix
-    tenor_vols = np.sqrt(np.diag(Sigma))                  # (n,)
-    D_inv      = np.diag(1.0 / np.where(tenor_vols > 0, tenor_vols, 1.0))
+    # Trim: keep only rows [win-1 :] where the full window is available
+    delta_trim = delta_f_clean[win - 1:]                    # (T_trim, n)
+    mu_trim    = mu_full[win - 1:]                          # (T_trim, n)
+    T_trim     = delta_trim.shape[0]
 
-    # Step 3: correlation matrix  R = D^{-1} Sigma D^{-1}
-    R = D_inv @ Sigma @ D_inv
-    np.fill_diagonal(R, 1.0)                              # enforce exact diagonal
+    X_c   = delta_trim - mu_trim                            # (T_trim, n)
+    Sigma = X_c.T @ X_c / (T_trim - 1)                     # (n, n)
 
-    # Step 4: eigendecompose R (eigh: real symmetric, ascending order)
-    eigenvalues, eigenvectors = eigh(R)
-    eigenvalues  = eigenvalues[::-1]                      # descending
+    eigenvalues, eigenvectors = eigh(Sigma)                 # ascending
+    eigenvalues  = eigenvalues[::-1]                        # descending
     eigenvectors = eigenvectors[:, ::-1]
 
-    explained  = eigenvalues / eigenvalues.sum()
+    total_var  = eigenvalues.clip(0).sum()
+    explained  = eigenvalues.clip(0) / (total_var if total_var > 0 else 1.0)
     cumulative = np.cumsum(explained)
 
-    # Factor scores projected onto correlation eigenvectors
-    scores = X_c @ eigenvectors[:, :n_factors]            # (T, n_factors)
+    scores = X_c @ eigenvectors[:, :n_factors]              # (T_trim, K)
+
+    # ------------------------------------------------------------------
+    # Step 2: estimate kappa_k from log-linear OLS on each eigenvector
+    # ------------------------------------------------------------------
+    kappa_hat = np.zeros(n_factors)
+    kappa_r2  = np.zeros(n_factors)
+
+    tau_c = taus - taus.mean()                              # centred tenors
+    denom = (tau_c ** 2).sum()
+
+    for k in range(n_factors):
+        vk   = eigenvectors[:, k]
+        # Use absolute value; sign convention is arbitrary in PCA
+        logv = np.log(np.abs(vk).clip(1e-15))
+        logv_c = logv - logv.mean()
+        slope  = -(tau_c @ logv_c) / denom                 # negated: decay
+        kappa_hat[k] = max(slope, 1e-4)                    # enforce positivity
+
+        # R^2 as quality-of-fit indicator
+        logv_fit  = logv.mean() - kappa_hat[k] * tau_c
+        ss_res = ((logv - logv_fit) ** 2).sum()
+        ss_tot = ((logv - logv.mean()) ** 2).sum()
+        kappa_r2[k] = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
+
+    # ------------------------------------------------------------------
+    # Step 3: build basis matrix E[j,k] = exp(-kappa_hat_k * tau_j)
+    # ------------------------------------------------------------------
+    E = np.exp(-kappa_hat[np.newaxis, :] * taus[:, np.newaxis])  # (n, K)
+
+    # ------------------------------------------------------------------
+    # Step 4: project Sigma into factor space
+    #   M = (E'E)^{-1} E' Sigma E (E'E)^{-1}
+    # ------------------------------------------------------------------
+    EtE = E.T @ E                                           # (K, K)
+    try:
+        EtE_inv = np.linalg.inv(EtE)
+    except np.linalg.LinAlgError:
+        EtE_inv = np.linalg.pinv(EtE)
+    M_hat = EtE_inv @ (E.T @ Sigma @ E) @ EtE_inv          # (K, K)
+
+    # ------------------------------------------------------------------
+    # Step 5: extract sigma_k and rho_kl from M
+    # ------------------------------------------------------------------
+    diag_M   = np.diag(M_hat).clip(0)
+    sigma_M  = np.sqrt(diag_M / dt)                        # (K,)
+
+    denom_rho = np.sqrt(np.outer(diag_M, diag_M)).clip(1e-20)
+    rho_M     = M_hat / denom_rho                          # (K, K)
+    np.fill_diagonal(rho_M, 1.0)
+    rho_M = np.clip(rho_M, -1.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # Step 6: fit scalar beta from rho_kl = exp(-beta * |k-l|)
+    # ------------------------------------------------------------------
+    beta_hat = _fit_beta_from_rho(rho_M)
 
     return {
+        # Covariance PCA
+        "sigma_hat":        Sigma,
         "eigenvalues":      eigenvalues,
         "eigenvectors":     eigenvectors,
         "explained_var":    explained,
@@ -1336,40 +1452,121 @@ def run_pca(
         "top_eigenvalues":  eigenvalues[:n_factors],
         "top_eigenvectors": eigenvectors[:, :n_factors],
         "scores":           scores,
-        "sigma_hat":        Sigma,
-        "corr_matrix":      R,
-        "tenor_vols":       tenor_vols,
         "n_factors":        n_factors,
-        "n_clean_days":     T,
+        "n_clean_days":     T_trim,        # rows used after trimming first (win-1)
+        "rolling_mean":     mu_trim,       # (T_trim, n) rolling-mean matrix
+        "rolling_window":   win,
+        # kappa identification
+        "kappa_hat":        kappa_hat,
+        "kappa_ols_r2":     kappa_r2,
+        # projection
+        "E_matrix":         E,
+        "M_hat":            M_hat,
+        # G3++ parameters
+        "sigma_from_M":     sigma_M,
+        "rho_from_M":       rho_M,
+        "beta_hat":         beta_hat,
     }
 
 
-def build_loading_correlation(
-    pca_result: dict,
-) -> dict:
+def _fit_beta_from_rho(rho: np.ndarray) -> float:
     """
-    Build the G5++ factor correlation matrix from correlation PCA.
+    Fit the scalar correlation decay parameter beta from an empirical
+    K x K correlation matrix via:
+        beta = argmin_{b > 0} sum_{k < l} (rho[k,l] - exp(-b*|k-l|))^2
 
-    Construction
-    ------------
-    PCA is performed on the correlation matrix R (see run_pca).
-    The top-K eigenvectors V_{R,K} are (n x K) and already live in
-    correlation space — each column is a unit-norm shape (level, slope,
-    curvature, ...) with no per-tenor volatility mixed in.
+    Uses bisection on the strictly monotone scalar objective.
+    Falls back to moment-matching (mean adjacent rho) if the
+    minimiser is outside [1e-4, 20].
+    """
+    K = rho.shape[0]
+    pairs = [(k, l) for k in range(K) for l in range(k + 1, K)]
+    if not pairs:
+        return 0.3   # default for K=1
 
-    Extract the K x K sub-block from the first K rows of V_{R,K}:
+    def objective(b):
+        return sum((rho[k, l] - np.exp(-b * abs(k - l))) ** 2
+                   for k, l in pairs)
 
-        V_fac    = V_{R,K}[:K, :]               (K x K)
+    # Grid search for bracket then golden-section refinement
+    b_grid  = np.linspace(1e-3, 15.0, 300)
+    obj_val = np.array([objective(b) for b in b_grid])
+    b_best  = float(b_grid[np.argmin(obj_val)])
 
-    Row-normalise so each factor has unit self-correlation:
+    # Golden-section refinement in [b_best - step, b_best + step]
+    step = b_grid[1] - b_grid[0]
+    lo, hi = max(1e-4, b_best - step), min(20.0, b_best + step)
+    phi = (np.sqrt(5) - 1) / 2
+    for _ in range(50):
+        b1 = hi - phi * (hi - lo)
+        b2 = lo + phi * (hi - lo)
+        if objective(b1) < objective(b2):
+            hi = b2
+        else:
+            lo = b1
+        if hi - lo < 1e-8:
+            break
+    return float((lo + hi) / 2)
 
-        V_fac_rn = V_fac / row_norms            (K x K)
-        rho      = V_fac_rn @ V_fac_rn.T        (K x K, unit diagonal)
 
-    This is the G5++ inter-factor correlation matrix used for the
-    Cholesky decomposition.  It is purely correlation-based: no
-    per-tenor volatility (D) and no eigenvalue scaling (Lambda^{1/2})
-    are applied here.
+def compute_rotation_L(sigma_k: np.ndarray, rho: np.ndarray) -> np.ndarray:
+    """
+    Compute the rotation matrix L = S R^{1/2}  (K x K).
+
+    This is the unique factor such that  L L^T = S R S  (= M / dt),
+    connecting the plain exponential basis E to the composite basis
+    E_tilde = E L seen by PCA:
+
+        Sigma = E M E^T = E (L L^T) E^T dt = (EL)(EL)^T dt
+              = E_tilde E_tilde^T dt
+
+    Derivation
+    ----------
+    M / dt = S R S  where  S = diag(sigma_k),  R = (rho_kl).
+
+    Factor R = R^{1/2} R^{1/2}  (spectral square root; R is spd).
+    Then:
+        (S R^{1/2})(S R^{1/2})^T = S R^{1/2} (R^{1/2})^T S^T
+                                  = S R^{1/2} R^{1/2} S   (S diagonal => S^T = S)
+                                  = S R S  ✓
+
+    Note:  L = S R^{1/2},  NOT  S^{1/2} R^{1/2}.
+    The latter gives  (S^{1/2} R^{1/2})(S^{1/2} R^{1/2})^T = S^{1/2} R S^{1/2},
+    which differs from S R S whenever sigma_k are not all equal.
+
+    Parameters
+    ----------
+    sigma_k : (K,) array   factor volatilities  sigma_k  (yr^{-1/2} units)
+    rho     : (K, K) array  factor correlation matrix  (unit diagonal, spd)
+
+    Returns
+    -------
+    L       : (K, K) array   rotation matrix  S R^{1/2}
+    E_tilde : callable       use as  E_tilde = E @ L  where E is the (n, K)
+                             basis matrix from run_pca()["E_matrix"]
+    """
+    S = np.diag(sigma_k)                          # (K, K) diagonal
+
+    # Spectral square root of R: R = V D V^T  =>  R^{1/2} = V D^{1/2} V^T
+    eigvals, eigvecs = eigh(rho)                  # ascending; rho is spd
+    eigvals = eigvals.clip(0)                     # guard against tiny negatives
+    R_half  = eigvecs @ np.diag(np.sqrt(eigvals)) @ eigvecs.T
+
+    L = S @ R_half                                # (K, K)
+    return L
+
+
+def build_loading_correlation(pca_result: dict) -> dict:
+    """
+    Build the G3++ factor correlation matrix from the covariance PCA result.
+
+    This is a thin compatibility wrapper that extracts the rho matrix
+    already computed inside run_pca() via the factor-space projection
+    (Section 6.7.3 of the companion paper):
+
+        rho[k,l] = M_hat[k,l] / sqrt(M_hat[k,k] * M_hat[l,l])
+
+    where M_hat = (E'E)^{-1} E' Sigma_diff E (E'E)^{-1}.
 
     Parameters
     ----------
@@ -1378,67 +1575,46 @@ def build_loading_correlation(
     Returns
     -------
     dict with keys:
-        V_fac      : (n_factors, n_factors)  raw factor sub-block of V_{R,K}
-        V_fac_rn   : (n_factors, n_factors)  row-normalised factor block
-        rho        : (n_factors, n_factors)  G5++ factor correlation matrix
-        row_norms  : (n_factors,) row norms of V_fac (pre-normalisation)
-        var_explained : float  fraction of correlation variance in top-K
+        rho          : (n_factors, n_factors)  G3++ factor correlation matrix
+        sigma_from_M : (n_factors,)            sigma_k estimates from M diagonal
+        beta_hat     : float                   fitted beta parameter
+        M_hat        : (n_factors, n_factors)  factor-space covariance matrix
+        var_explained: float  fraction of Sigma variance in top-K
     """
-    n_factors = pca_result["n_factors"]
-    eigvecs_K = pca_result["top_eigenvectors"]   # (n, K)
-
-    # K x K sub-block: first K rows of the correlation eigenvectors
-    V_fac     = eigvecs_K[:n_factors, :]                    # (K, K)
-    row_norms = np.sqrt(np.sum(V_fac ** 2, axis=1))         # (K,)
-
-    # Row-normalise -> unit diagonal correlation matrix
-    denom     = np.where(row_norms > 1e-12, row_norms, 1.0)
-    V_fac_rn  = V_fac / denom[:, np.newaxis]
-
-    rho = V_fac_rn @ V_fac_rn.T
-    np.fill_diagonal(rho, 1.0)   # enforce exact unit diagonal
-
     var_explained = (pca_result["top_eigenvalues"].sum()
-                     / pca_result["eigenvalues"].sum())
-
+                     / pca_result["eigenvalues"].clip(0).sum()
+                     if pca_result["eigenvalues"].clip(0).sum() > 0 else 0.0)
     return {
-        "V_fac":         V_fac,
-        "V_fac_rn":      V_fac_rn,
-        "rho":           rho,
-        "row_norms":     row_norms,
+        "rho":          pca_result["rho_from_M"],
+        "sigma_from_M": pca_result["sigma_from_M"],
+        "beta_hat":     pca_result["beta_hat"],
+        "M_hat":        pca_result["M_hat"],
         "var_explained": var_explained,
     }
 
 
 def init_kappa_logspaced(
-    n_factors: int = 5,
+    n_factors: int = 3,
     kappa_min: float = 0.05,
     kappa_max: float = 3.0,
 ) -> np.ndarray:
     """
-    Initialise G5++ decay rates kappa_k on a log-spaced grid.
+    Fallback G3++ decay rate initialisation on a log-spaced grid.
 
     Rationale
     ---------
-    The decay rates kappa_k are NOT identifiable from PCA of the
-    correlation matrix.  PCA only identifies rho_kl (via the
-    row-normalised loading matrix).  sigma_k requires knowing kappa_k
-    first (the loading sigma_k*exp(-kappa_k*tau) is not separable
-    without kappa_k), so sigma_k is obtained from one inner NNLS pass
-    at fixed kappa^{(0)} and rho^{(0)} — see g5pp_calibration.py.
+    The preferred kappa_k initialisation is the OLS log-linear regression on
+    covariance PCA eigenvector shapes (run_pca -> kappa_hat).  This function
+    provides a robust fallback when the eigenvector regression is unreliable
+    (e.g. low R^2, insufficient tenor range, or noisy data).
 
-    The per-tenor variance in G5++ is:
-        Sigma_diff[j,j] = sum_k sigma_k^2 * exp(-2 * kappa_k * tau_j) * dt
-
-    which is a mixture of decaying exponentials.  Recovering individual
-    kappa_k from this mixture is ill-conditioned; instead we use a
-    log-spaced grid spanning the full tenor range, placing one factor
-    in each decay regime.  The nonlinear outer optimisation loop then
-    refines all kappa_k from this starting point.
+    A log-spaced grid spanning [kappa_min, kappa_max] places one factor in
+    each decay regime:  slow (level), medium (slope), fast (curvature).
+    For K=3: kappa^{(0)} ≈ (0.05, 0.39, 3.0) yr^{-1}.
 
     Parameters
     ----------
-    n_factors : int    number of factors K (default 5)
+    n_factors : int    number of factors K (default 3)
     kappa_min : float  slowest decay rate in yr^{-1} (default 0.05)
     kappa_max : float  fastest decay rate in yr^{-1} (default 3.0)
 
@@ -1450,39 +1626,46 @@ def init_kappa_logspaced(
 
 
 def print_pca_summary(pca_result: dict, loading_result: dict) -> None:
-    """Print PCA variance decomposition and correlation matrix."""
+    """Print PCA variance decomposition and G3++ identification results."""
     n_f  = pca_result["n_factors"]
     evs  = pca_result["top_eigenvalues"]
     expv = pca_result["explained_var"][:n_f]
     cumv = pca_result["cumulative_var"][:n_f]
 
-    print("\n" + "=" * 58)
-    print("PCA SUMMARY")
-    print("=" * 58)
-    print(f"  Clean days used : {pca_result['n_clean_days']}")
-    print(f"  Tenors (n)      : {pca_result['sigma_hat'].shape[0]}")
-    print(f"  Retained factors: {n_f}")
+    print("\n" + "=" * 66)
+    print("PCA SUMMARY  (covariance matrix, K={})".format(n_f))
+    print("=" * 66)
+    print(f"  Clean days  : {pca_result['n_clean_days']}")
+    print(f"  Tenors (n)  : {pca_result['sigma_hat'].shape[0]}")
     print()
-    print(f"  {'Factor':>7}  {'Eigenvalue':>12}  {'Expl. Var':>10}  {'Cumul.':>8}")
-    print(f"  {'-'*7}  {'-'*12}  {'-'*10}  {'-'*8}")
+    print(f"  {'Factor':>7}  {'Eigenvalue':>14}  {'Expl. Var':>10}  {'Cumul.':>8}  "
+          f"{'kappa_hat':>10}  {'OLS R²':>8}")
+    print(f"  {'-'*7}  {'-'*14}  {'-'*10}  {'-'*8}  {'-'*10}  {'-'*8}")
+    kappas = pca_result["kappa_hat"]
+    r2s    = pca_result["kappa_ols_r2"]
     for k in range(n_f):
-        print(f"  {k+1:>7}  {evs[k]:>12.4e}  {100*expv[k]:>9.2f}%  {100*cumv[k]:>7.2f}%")
+        print(f"  {k+1:>7}  {evs[k]:>14.4e}  {100*expv[k]:>9.2f}%  "
+              f"{100*cumv[k]:>7.2f}%  {kappas[k]:>10.4f}  {r2s[k]:>8.4f}")
     print()
-    print(f"  Variance in top-{n_f}: "
-          f"{100*loading_result['var_explained']:.2f}%")
+    print(f"  Variance in top-{n_f}: {100*loading_result['var_explained']:.2f}%")
+
     print()
-    print(f"  Row norms of V_fac (pre-normalisation):")
-    for k, rn in enumerate(loading_result["row_norms"]):
-        print(f"    Factor {k+1}: {rn:.4f}")
+    print("  G3++ parameters from factor-space projection M:")
+    sigma_M = loading_result["sigma_from_M"]
+    beta_h  = loading_result["beta_hat"]
+    for k in range(n_f):
+        print(f"    sigma_{k+1} = {sigma_M[k]*1e4:8.3f} bps/sqrt(yr)    "
+              f"kappa_{k+1} = {kappas[k]:.4f} yr^-1")
+    print(f"    beta_hat  = {beta_h:.4f}")
     print()
-    print("  G5++ Correlation matrix R = L @ L.T:")
+    print("  G3++ Correlation matrix (from M projection):")
     rho = loading_result["rho"]
-    header = "         " + "".join(f" F{k+1:>5}" for k in range(n_f))
+    header = "         " + "".join(f" F{k+1:>6}" for k in range(n_f))
     print(header)
     for k in range(n_f):
-        row = f"  F{k+1:>5}  " + "  ".join(f"{rho[k,l]:>6.3f}" for l in range(n_f))
+        row = f"  F{k+1:>5}  " + "  ".join(f"{rho[k,l]:>7.3f}" for l in range(n_f))
         print(row)
-    print("=" * 58)
+    print("=" * 66)
 
 
 # =============================================================================
@@ -2118,12 +2301,13 @@ def run_pipeline(
     zero_rates,
     pillar_tenors=None,
     dates=None,
-    n_factors: int = 5,
+    n_factors: int = 3,
     jump_kwargs: dict = None,
     verbose: bool = True,
     output_dir: str = None,
     csv_prefix: str = "sofr",
     method: str = "fd",
+    dt: float = 1.0 / 360,
 ) -> dict:
     """
     End-to-end pipeline: zero rates -> forward rates -> jump detection -> PCA.
@@ -2177,7 +2361,7 @@ def run_pipeline(
     dates         : (T,) array-like or None
                                   date labels.  Ignored when zero_rates is a
                                   DataFrame (dates are taken from df.index).
-    n_factors     : int           PCA components to retain (default 5)
+    n_factors     : int           PCA components to retain (default 3)
     jump_kwargs   : dict or None  override detect_jumps() defaults:
                                   window, alpha_bpv, alpha_mah, n_iter, reg
     verbose       : bool          print step-by-step summaries (default True)
@@ -2188,6 +2372,7 @@ def run_pipeline(
                                   "cubic"    C2 not-a-knot spline with Y(0)=0 anchor
                                   "monotone" Hyman Hermite, guarantees f>=0
                                   "flat"     piecewise-constant, exact on all intervals
+    dt            : float         time step in years for sigma extraction (default 1/360, ACT/360)
 
     Returns
     -------
@@ -2203,9 +2388,11 @@ def run_pipeline(
         jump_table      : list of dicts  one per (day, tenor) jump event
         pca_result      : dict  output of run_pca()
         loading_result  : dict  output of build_loading_correlation()
-        rho             : (n_factors, n_factors) G5++ factor correlation
-        kappa0          : (n_factors,) log-spaced kappa initialisation
-        beta0           : float  beta init (moment-matched from rho_kl)
+        rho             : (n_factors, n_factors) G3++ factor correlation from M projection
+        kappa0          : (n_factors,) kappa initialisation from OLS eigenvector regression
+        sigma0          : (n_factors,) sigma initialisation from M diagonal
+        beta0           : float  beta init from exponential fit to rho_kl
+        M_hat           : (n_factors, n_factors) factor-space covariance matrix
         csv_paths       : dict  {filename: full_path} for each file written
     """
     # ------------------------------------------------------------------
@@ -2319,31 +2506,42 @@ def run_pipeline(
               f"across {n_jmp_days} event days")
 
     # ------------------------------------------------------------------
-    # 6. PCA on cleaned changes
+    # 6. PCA on cleaned changes + G3++ identification bridge
     # ------------------------------------------------------------------
     if verbose:
-        print(f"\n[5] PCA on cleaned sample ...")
+        print(f"\n[5] PCA (covariance, K={n_factors}) + G3++ identification ...")
 
-    pca_result     = run_pca(delta_f_cln, n_factors=n_factors)
+    pca_result     = run_pca(delta_f_cln, pillar_tenors=fwd_tenors,
+                             n_factors=n_factors, dt=dt)
     loading_result = build_loading_correlation(pca_result)
 
     if verbose:
         print_pca_summary(pca_result, loading_result)
 
     # ------------------------------------------------------------------
-    # 7. G5++ initialisation
+    # 7. G3++ initialisation — all parameters from identification bridge
     # ------------------------------------------------------------------
-    kappa0   = init_kappa_logspaced(n_factors=n_factors)
+    # Primary: kappa from OLS eigenvector regression; fall back to log-spaced
+    # grid if any R^2 is below 0.5 (unreliable regression)
+    if pca_result["kappa_ols_r2"].min() >= 0.5:
+        kappa0 = pca_result["kappa_hat"].copy()
+    else:
+        kappa0 = init_kappa_logspaced(n_factors=n_factors)
+        if verbose:
+            print(f"  [warn] Low kappa OLS R² "
+                  f"({pca_result['kappa_ols_r2'].round(3)}) — "
+                  f"falling back to log-spaced grid.")
+
+    sigma0   = loading_result["sigma_from_M"]
     rho_mat  = loading_result["rho"]
-    adj_corr = np.array([rho_mat[k, k + 1] for k in range(n_factors - 1)])
-    mean_adj = np.clip(adj_corr.mean(), 1e-6, 1.0 - 1e-6)
-    beta0    = -np.log(mean_adj)
+    beta0    = loading_result["beta_hat"]
+    M_hat    = loading_result["M_hat"]
 
     if verbose:
-        print(f"\n[6] G5++ initialisation:")
+        print(f"\n[6] G3++ initialisation:")
         print(f"    kappa0 = {np.round(kappa0, 4)}")
-        print(f"    beta0  = {beta0:.4f}  "
-              f"(moment-matched, mean adjacent rho = {mean_adj:.3f})")
+        print(f"    sigma0 = {np.round(sigma0 * 1e4, 2)} bps/sqrt(yr)")
+        print(f"    beta0  = {beta0:.4f}")
 
     # ------------------------------------------------------------------
     # 8. CSV and figure outputs
@@ -2424,9 +2622,11 @@ def run_pipeline(
         "jump_table":      jump_table,
         "pca_result":      pca_result,
         "loading_result":  loading_result,
-        "rho":             loading_result["rho"],
+        "rho":             rho_mat,
         "kappa0":          kappa0,
+        "sigma0":          sigma0,
         "beta0":           beta0,
+        "M_hat":           M_hat,
         "csv_paths":       csv_paths,
     }
 
@@ -2444,7 +2644,7 @@ def _make_synthetic_sofr(
     Generate a synthetic SOFR zero rate time series for testing.
 
     Simulates:
-      - 5-factor Gaussian diffusion (level, slope, curvature, hump, ultra-short)
+      - 3-factor Gaussian diffusion (level, slope, curvature)
       - n_jump_days discrete jumps (simulating FOMC surprises) at random dates
     """
     rng = np.random.default_rng(seed)
@@ -2455,13 +2655,10 @@ def _make_synthetic_sofr(
     # --- Base zero curve (flat at 5%, slight inversion at short end) ---
     base_Z = (5.0 - 0.5 * np.exp(-pillar_tenors / 3)) / 100
 
-    # --- 5-factor OU process parameters ---
-    # Daily vol in rate units (bps/day ~ 5 bps/day for level factor)
-    # Mean-reverting OU: dX_k = -kappa_k * X_k * dt + sigma_k * dW_k
-    # where X_k are the state variables, not the rates directly.
-    kappas      = np.array([0.001, 0.01, 0.05, 0.15, 0.4])   # daily mean-reversion
-    sigmas_bps  = np.array([5.0,   3.0,  2.0,  1.5,  1.0])   # bps/sqrt(day)
-    sigmas      = sigmas_bps * 1e-4                            # decimal
+    # --- 3-factor OU process parameters (level, slope, curvature) ---
+    kappas      = np.array([0.05, 0.39, 3.0])              # yr^{-1} (log-spaced)
+    sigmas_bps  = np.array([5.0,  3.0,  2.0])              # bps/sqrt(day)
+    sigmas      = sigmas_bps * 1e-4                         # decimal
 
     def vol_shape(kappa, tau):
         """B_k(tau) = (1 - exp(-kappa*tau)) / kappa — factor loading shape."""
@@ -2469,30 +2666,33 @@ def _make_synthetic_sofr(
             return np.where(kappa < 1e-8, tau, (1 - np.exp(-kappa * tau)) / kappa)
 
     # Factor loadings on zero rates: dZ(tau) = sum_k sigma_k * B_k(tau) * dW_k
-    B = np.stack([vol_shape(k, pillar_tenors) for k in kappas], axis=0)  # (5, n_pillars)
+    B = np.stack([vol_shape(k, pillar_tenors) for k in kappas], axis=0)  # (3, n_pillars)
     # Normalise each row so that max|B_k| = 1 (pure shape, amplitude in sigma)
     B_norms = np.abs(B).max(axis=1, keepdims=True)
     B = B / np.where(B_norms < 1e-12, 1.0, B_norms)
 
-    # Cholesky of simple exponential correlation  rho_kl = exp(-0.5*|k-l|)
-    idx  = np.arange(5)
-    Rho  = np.exp(-0.5 * np.abs(idx[:, None] - idx[None, :]))
+    # Cholesky of exponential correlation  rho_kl = exp(-0.3*|k-l|)
+    idx  = np.arange(3)
+    Rho  = np.exp(-0.3 * np.abs(idx[:, None] - idx[None, :]))
     chol = np.linalg.cholesky(Rho)
 
     # --- Simulate zero rates (OU mean-reversion keeps levels realistic) ---
+    # kappas are in yr^{-1}; dt = 1/252 yr per step
+    dt_sim   = 1.0 / 252
     Z_series = np.zeros((T, n_pillars))
     Z_series[0] = base_Z.copy()
-    x_state = np.zeros(5)   # OU state variables
+    x_state = np.zeros(3)   # OU state variables
     for t in range(1, T):
-        z      = rng.standard_normal(5)
+        z      = rng.standard_normal(3)
         corr_z = chol @ z
-        # OU step: dx = -kappa*x*dt + sigma*dW  (dt=1 day)
+        # OU step: dx = -kappa*x*dt + sigma*sqrt(dt)*dW
+        x_state = x_state * (1 - kappas * dt_sim) + sigmas * np.sqrt(dt_sim) * corr_z
         x_state = x_state * (1 - kappas) + sigmas * corr_z
         dZ = x_state @ B          # (n_pillars,) zero rate daily change
         Z_series[t] = Z_series[t - 1] + dZ
 
-    # Clip to positive rates
-    Z_series = np.clip(Z_series, 1e-4, None)
+    # Clip to realistic rate range (0.01 bps to 30%)
+    Z_series = np.clip(Z_series, 1e-4, 0.30)
 
     # --- Inject jump days ---
     # Jumps are ~8–15x the typical daily diffusive move (clearly detectable)
@@ -2578,7 +2778,7 @@ if __name__ == "__main__":
         zero_rates    = zero_rates,
         pillar_tenors = pillar_tenors,
         dates         = dates,
-        n_factors     = 5,
+        n_factors     = 3,
         jump_kwargs   = {"window": 21, "alpha_bpv": 0.05, "alpha_mah": 0.001},
         verbose       = True,
         output_dir    = OUT_DIR,
@@ -2636,12 +2836,17 @@ if __name__ == "__main__":
             break
 
     # ------------------------------------------------------------------
-    # Correlation matrix
+    # Correlation matrix and G3++ parameters
     # ------------------------------------------------------------------
-    print(f"\nG5++ PCA-implied correlation matrix ({result['rho'].shape[0]}x{result['rho'].shape[0]}):")
+    print(f"\nG3++ PCA-identified parameters (K={result['rho'].shape[0]}):")
     rho    = result["rho"]
     K      = rho.shape[0]
     labels = [f"F{k+1}" for k in range(K)]
+    print(f"  kappa0 = {np.round(result['kappa0'], 4)}  yr^-1")
+    print(f"  sigma0 = {np.round(result['sigma0'] * 1e4, 2)}  bps/sqrt(yr)")
+    print(f"  beta0  = {result['beta0']:.4f}")
+    print()
+    print("  Correlation matrix rho (from M projection):")
     print("        " + "".join(f"  {lb:>7}" for lb in labels))
     for k in range(K):
         print(f"  {labels[k]:>5}  " + "  ".join(f"{rho[k, l]:>7.3f}" for l in range(K)))
