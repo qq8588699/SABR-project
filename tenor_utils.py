@@ -1134,9 +1134,76 @@ class DayCount:
 
     @property
     def dt(self) -> float:
-        """Year fraction per calendar day (pass as dt to run_pca)."""
-        ref = date(2024, 1, 15)
-        return self._apply(ref, ref + timedelta(days=1))
+        """
+        Year fraction per calendar day — derived analytically from the
+        convention definition, with no dependence on any reference date.
+
+        Values:
+            ACT/360  ->  1/360    = 0.002778  (exact)
+            ACT/365  ->  1/365    = 0.002740  (exact)
+            ACT/ACT  ->  1/365.25 = 0.002738  (long-run average, accounts
+                                               for 1 leap year in 4)
+            30/360   ->  1/360    = 0.002778  (exact)
+            BUS/252  ->  1/252    = 0.003968  (market convention; use
+                                               dt_for_year(y) for the exact
+                                               business day count in year y)
+        """
+        if self._convention in ("ACT/360", "30/360"):
+            return 1.0 / 360.0
+        elif self._convention == "ACT/365":
+            return 1.0 / 365.0
+        elif self._convention == "ACT/ACT":
+            # 365.25 is the long-run average (97 non-leap + 3 leap per 400 yrs
+            # gives (97*365 + 3*366) / 100 = 365.25 exactly over a 4-yr cycle).
+            return 1.0 / 365.25
+        elif self._convention == "BUS/252":
+            return 1.0 / 252.0
+        raise RuntimeError(f"Unhandled convention '{self._convention}'.")
+
+    def dt_for_year(self, year: int) -> float:
+        """
+        Year fraction per calendar day for a specific calendar year.
+
+        More precise than ``dt`` for ACT/ACT and BUS/252, where the
+        correct denominator depends on whether the year is a leap year
+        (ACT/ACT) or how many business days fall in the year (BUS/252).
+
+        For all other conventions the result is identical to ``dt``.
+
+        Parameters
+        ----------
+        year : int   the calendar year of the data being analysed
+
+        Returns
+        -------
+        float
+
+        Examples
+        --------
+        >>> DayCount("USD").dt_for_year(2024)
+        0.002778             # ACT/360, unchanged
+        >>> DayCount(convention="ACT/ACT").dt_for_year(2024)
+        0.002732             # 2024 is a leap year -> 1/366
+        >>> DayCount(convention="ACT/ACT").dt_for_year(2023)
+        0.002740             # 2023 is not a leap year -> 1/365
+        >>> DayCount("BRL").dt_for_year(2024)
+        ~0.003984            # actual CDI business days in 2024 / 252
+        """
+        if self._convention in ("ACT/360", "30/360"):
+            return 1.0 / 360.0
+        elif self._convention == "ACT/365":
+            return 1.0 / 365.0
+        elif self._convention == "ACT/ACT":
+            days_in_year = 366 if self._is_leap(year) else 365
+            return 1.0 / days_in_year
+        elif self._convention == "BUS/252":
+            # Count actual business days in this calendar year using the
+            # holiday calendar so the result matches the index (e.g. CDI)
+            start = date(year, 1, 1)
+            end   = date(year + 1, 1, 1)
+            bd    = self.business_days(start, end)
+            return 1.0 / bd
+        raise RuntimeError(f"Unhandled convention '{self._convention}'.")
 
     # ------------------------------------------------------------------
     # Year fraction methods
