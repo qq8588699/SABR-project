@@ -11,6 +11,11 @@ Classes
   TenorParser       Stateless tenor string parser (no dates needed)
   DayCount          Day count convention engine integrating calendar + convention
 
+Dependencies
+------------
+  holidays >= 0.46   pip install holidays
+  python-dateutil    pip install python-dateutil
+
 Quick start
 -----------
     from tenor_utils import DayCount, HolidayCalendar
@@ -42,6 +47,8 @@ import re
 from datetime import date, timedelta
 from dateutil.relativedelta import relativedelta
 from functools import lru_cache
+
+import holidays as _holidays_lib
 
 
 # =============================================================================
@@ -261,19 +268,6 @@ class HolidayCalendar:
     # Currencies that require post-generation Furikae/Kokumin processing
     _NEEDS_FURIKAE = frozenset({"JPY"})
 
-    # Cached flag: is the `holidays` library installed?
-    _HAS_HOLIDAYS_LIB: bool | None = None
-
-    @classmethod
-    def _holidays_lib_available(cls) -> bool:
-        """Return True if the third-party `holidays` library is installed."""
-        if cls._HAS_HOLIDAYS_LIB is None:
-            try:
-                import holidays  # noqa: F401
-                cls._HAS_HOLIDAYS_LIB = True
-            except ImportError:
-                cls._HAS_HOLIDAYS_LIB = False
-        return cls._HAS_HOLIDAYS_LIB
 
     @lru_cache(maxsize=64)
     def holidays(self, year: int) -> frozenset:
@@ -296,8 +290,7 @@ class HolidayCalendar:
         fn  = self._GENERATORS.get(self._currency, self._western_generic)
         raw = fn(self, year)
 
-        if self._currency in self._NEEDS_FURIKAE and \
-                not self._holidays_lib_available():
+        if self._currency in self._NEEDS_FURIKAE:
             raw = self._apply_furikae_simple(raw, year)
             # Add BoJ bank holidays AFTER Furikae so they don't block
             # substitute searches (e.g. Jan 1 Sun → sub is Jan 2, not Jan 4)
@@ -640,23 +633,16 @@ class HolidayCalendar:
         day searches (e.g. Jan 1 Sunday -> substitute should be Jan 2, not
         Jan 4 just because Jan 2/3 are BoJ extras).
         """
-        try:
-            import holidays as hol_lib
-            jp  = hol_lib.Japan(years=year)
-            raw = list(jp.keys())
-            # The holidays library handles Sunday Furikae and Kokumin but
-            # does NOT generate substitutes for Saturday holidays.
-            # Apply a Saturday-only Furikae pass to fill that gap.
-            raw = self._apply_saturday_furikae(raw, year)
-            # Add BoJ extras AFTER Furikae so they don't block substitute
-            # searches.
-            boj = [date(year, m, d) for m, d in self._JPY_BOJ_EXTRA]
-            return raw + [d for d in boj if d not in set(raw)]
-        except ImportError:
-            # Return ONLY the national holidays here.
-            # BoJ extras are added by holidays() AFTER _apply_furikae_simple.
-            return self._jpy_fallback(year)
-
+        jp  = _holidays_lib.Japan(years=year)
+        raw = list(jp.keys())
+        # The holidays library handles Sunday Furikae and Kokumin but
+        # does NOT generate substitutes for Saturday holidays.
+        # Apply a Saturday-only Furikae pass to fill that gap.
+        raw = self._apply_saturday_furikae(raw, year)
+        # Add BoJ extras AFTER Furikae so they don't block substitute
+        # searches.
+        boj = [date(year, m, d) for m, d in self._JPY_BOJ_EXTRA]
+        return raw + [d for d in boj if d not in set(raw)]
     @staticmethod
     def _apply_saturday_furikae(raw: list, year: int) -> list:
         """
@@ -688,13 +674,8 @@ class HolidayCalendar:
 
     def _jpy_national_only(self, year: int) -> list:
         """National holidays without BoJ bank holiday extras (used by holidays())."""
-        try:
-            import holidays as hol_lib
-            jp = hol_lib.Japan(years=year)
-            return list(jp.keys())
-        except ImportError:
-            return self._jpy_fallback(year)
-
+        jp = _holidays_lib.Japan(years=year)
+        return list(jp.keys())
     def _jpy_fallback(self, year: int) -> list:
         """
         Pure-Python fallback JPY national holiday generator used when the
@@ -984,70 +965,15 @@ class HolidayCalendar:
         # HKD holidays include many lunar-calendar dates (CNY, Qingming, Dragon Boat,
         # Mid-Autumn, Chung Yeung) plus observed/substitute days that shift year to year.
         # Delegate to the holidays library when available for accurate dates.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.HongKong(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays only
-            e = _easter(year)
-            cny_map = {
-                2008: date(2008, 2, 7), 2009: date(2009, 1, 26),
-                2010: date(2010, 2, 14), 2011: date(2011, 2, 3),
-                2012: date(2012, 1, 23), 2013: date(2013, 2, 10),
-                2014: date(2014, 1, 31), 2015: date(2015, 2, 19),
-                2016: date(2016, 2, 8), 2017: date(2017, 1, 28),
-                2018: date(2018, 2, 16), 2019: date(2019, 2, 5),
-                2020: date(2020, 1, 25), 2021: date(2021, 2, 12),
-                2022: date(2022, 2, 1), 2023: date(2023, 1, 22),
-                2024: date(2024, 2, 10), 2025: date(2025, 1, 29),
-            }
-            cny = cny_map.get(year, date(year, 2, 5))
-            return [
-                date(year, 1, 1),                      # New Year's Day
-                cny, cny + timedelta(1), cny + timedelta(2),  # CNY day 1-3
-                e - timedelta(days=2),                  # Good Friday
-                e + timedelta(days=1),                  # Easter Monday
-                date(year, 5, 1),                       # Labour Day
-                date(year, 7, 1),                       # HKSAR Establishment Day
-                date(year, 10, 1),                      # National Day
-                date(year, 12, 25),                     # Christmas Day
-                date(year, 12, 26),                     # Boxing Day
-            ]
-
+        lib = _holidays_lib.HongKong(years=year)
+        return [d for d in lib.keys() if d.year == year]
     # ── SGD — Singapore ───────────────────────────────────────────────
     def _sgd(self, year: int) -> list:
         # SGD holidays include Islamic (Hari Raya Puasa/Haji), Hindu (Deepavali),
         # Buddhist (Vesak Day) and Chinese (CNY) lunar calendar dates that shift
         # significantly year to year. Delegate to the holidays library for accuracy.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Singapore(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays only
-            e = _easter(year)
-            cny_map = {
-                2008: date(2008, 2, 7), 2009: date(2009, 1, 26),
-                2010: date(2010, 2, 14), 2011: date(2011, 2, 3),
-                2012: date(2012, 1, 23), 2013: date(2013, 2, 10),
-                2014: date(2014, 1, 31), 2015: date(2015, 2, 19),
-                2016: date(2016, 2, 8), 2017: date(2017, 1, 28),
-                2018: date(2018, 2, 16), 2019: date(2019, 2, 5),
-                2020: date(2020, 1, 25), 2021: date(2021, 2, 12),
-                2022: date(2022, 2, 1), 2023: date(2023, 1, 22),
-                2024: date(2024, 2, 10), 2025: date(2025, 1, 29),
-            }
-            cny = cny_map.get(year, date(year, 2, 5))
-            return [
-                date(year, 1, 1),                      # New Year's Day
-                cny, cny + timedelta(1),               # CNY day 1-2
-                e - timedelta(days=2),                  # Good Friday
-                date(year, 5, 1),                       # Labour Day
-                date(year, 8, 9),                       # National Day
-                date(year, 12, 25),                     # Christmas Day
-            ]
-
+        lib = _holidays_lib.Singapore(years=year)
+        return [d for d in lib.keys() if d.year == year]
     # ── NOK — Oslo ────────────────────────────────────────────────────
     def _nok(self, year: int) -> list:
         e = _easter(year)
@@ -1157,14 +1083,10 @@ class HolidayCalendar:
             hols.append(e - timedelta(days=2))
         # Pihenőnap: government-decreed bridge/rest days (vary each year)
         # Use the holidays library when available to get accurate dates
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Hungary(years=year)
-            for d, name in lib.items():
-                if 'Pihenőnap' in name and d.weekday() < 5:
-                    hols.append(d)
-        except ImportError:
-            pass
+        lib = _holidays_lib.Hungary(years=year)
+        for d, name in lib.items():
+            if 'Pihenőnap' in name and d.weekday() < 5:
+                hols.append(d)
         return hols
 
     # ── CZK — Prague ──────────────────────────────────────────────────
@@ -1192,12 +1114,8 @@ class HolidayCalendar:
     # ── RON — Bucharest ───────────────────────────────────────────────
     def _ron(self, year: int) -> list:
         # Romania uses Orthodox Easter — always fetch from library when available
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Romania(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            pass
+        lib = _holidays_lib.Romania(years=year)
+        return [d for d in lib.keys() if d.year == year]
         # Fallback: approximate with Western Easter (will be wrong some years)
         e = _easter(year)
         hols = [
@@ -1224,45 +1142,15 @@ class HolidayCalendar:
     def _ils(self, year: int) -> list:
         # Jewish holidays use the Hebrew lunar calendar; exact dates vary each year.
         # Delegate to the holidays library when available for accurate dates.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Israel(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            # Minimal fallback — only Rosh Hashanah approximate date
-            return [date(year, 9, 16)]
-
+        lib = _holidays_lib.Israel(years=year)
+        return [d for d in lib.keys() if d.year == year]
     # ── ZAR — Johannesburg ────────────────────────────────────────────
     def _zar(self, year: int) -> list:
         # ZAR uses forward substitution (Saturday → Monday, not Friday) and includes
         # unpredictable election days and presidential decree holidays.
         # Delegate to the library for accurate dates.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.SouthAfrica(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays with forward substitute rule
-            e = _easter(year)
-            def _fwd(d):
-                if d.weekday() == 5: return d + timedelta(days=2)
-                if d.weekday() == 6: return d + timedelta(days=1)
-                return d
-            return [
-                _fwd(date(year, 1, 1)),                # New Year's Day
-                _fwd(date(year, 3, 21)),               # Human Rights Day
-                e - timedelta(days=2),                 # Good Friday
-                e + timedelta(days=1),                 # Family Day
-                _fwd(date(year, 4, 27)),               # Freedom Day
-                _fwd(date(year, 5, 1)),                # Workers' Day
-                _fwd(date(year, 6, 16)),               # Youth Day
-                _fwd(date(year, 8, 9)),                # National Women's Day
-                _fwd(date(year, 9, 24)),               # Heritage Day
-                _fwd(date(year, 12, 16)),              # Day of Reconciliation
-                _fwd(date(year, 12, 25)),              # Christmas Day
-                _fwd(date(year, 12, 26)),              # Day of Goodwill
-            ]
-
+        lib = _holidays_lib.SouthAfrica(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── BRL — São Paulo ───────────────────────────────────────────────
     def _brl(self, year: int) -> list:
         e = _easter(year)
@@ -1334,247 +1222,77 @@ class HolidayCalendar:
         # CLP holidays include many shifted/renamed dates (Columbus Day → Día del Encuentro,
         # San Pedro y San Pablo moved to nearest Monday, Fiestas Patrias bridge days,
         # census days, and other one-offs). Delegate to the library for accuracy.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Chile(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            # Minimal fallback
-            e = _easter(year)
-            return [
-                date(year, 1, 1),
-                e - timedelta(days=2),                 # Good Friday
-                date(year, 5, 1),                      # Labour Day
-                date(year, 5, 21),                     # Navy Day
-                date(year, 8, 15),                     # Assumption Day
-                date(year, 9, 18),                     # Independence Day
-                date(year, 9, 19),                     # Army Day
-                date(year, 11, 1),                     # All Saints' Day
-                date(year, 12, 8),                     # Immaculate Conception
-                date(year, 12, 25),
-            ]
-
+        lib = _holidays_lib.Chile(years=year)
+        return [d for d in lib.keys() if d.year == year]
     # ── CNY — Shanghai ────────────────────────────────────────────────
     def _cny(self, year: int) -> list:
         # CNY holidays include Qingming (Solar Term), Dragon Boat, Mid-Autumn
         # and Golden Week — all with precise dates and government-decreed bridge days
         # (休息日) that shift annually. Delegate to the library for accuracy.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.China(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays only (no bridge days)
-            cny_map = {
-                2008: date(2008, 2, 7), 2009: date(2009, 1, 26),
-                2010: date(2010, 2, 14), 2011: date(2011, 2, 3),
-                2012: date(2012, 1, 23), 2013: date(2013, 2, 10),
-                2014: date(2014, 1, 31), 2015: date(2015, 2, 19),
-                2016: date(2016, 2, 8), 2017: date(2017, 1, 28),
-                2018: date(2018, 2, 16), 2019: date(2019, 2, 5),
-                2020: date(2020, 1, 25), 2021: date(2021, 2, 12),
-                2022: date(2022, 2, 1), 2023: date(2023, 1, 22),
-                2024: date(2024, 2, 10), 2025: date(2025, 1, 29),
-            }
-            cny = cny_map.get(year, date(year, 2, 5))
-            hols = [cny + timedelta(days=i) for i in range(7)]
-            hols += [
-                date(year, 1, 1),
-                date(year, 4, 4),
-                date(year, 5, 1),
-                date(year, 10, 1), date(year, 10, 2), date(year, 10, 3),
-                date(year, 10, 4), date(year, 10, 5), date(year, 10, 6),
-                date(year, 10, 7),
-            ]
-            return hols
-
+        lib = _holidays_lib.China(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── INR — Mumbai ──────────────────────────────────────────────────
     def _inr(self, year: int) -> list:
         # INR holidays include Diwali, Holi, Eid al-Fitr, Eid al-Adha, Buddha Purnima,
         # Guru Nanak Jayanti and others on Hindu/Islamic/Buddhist lunar calendars
         # that shift significantly each year. Delegate to the library for accuracy.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.India(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed national holidays only
-            e = _easter(year)
-            return [
-                date(year, 1, 26),                     # Republic Day
-                e - timedelta(days=2),                 # Good Friday
-                date(year, 8, 15),                     # Independence Day
-                date(year, 10, 2),                     # Gandhi Jayanti
-                date(year, 12, 25),                    # Christmas
-            ]
-
+        lib = _holidays_lib.India(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── IDR — Jakarta ─────────────────────────────────────────────────
     def _idr(self, year: int) -> list:
         # IDR holidays include Eid al-Fitr, Eid al-Adha, Isra Mi'raj, Islamic New Year,
         # Maulid, Nyepi (Hindu Balinese), Waisak (Buddhist) — all on lunar calendars —
         # plus Chinese New Year, Ascension and election days. Delegate to library.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Indonesia(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed secular holidays only
-            e = _easter(year)
-            return [
-                date(year, 1, 1),                      # New Year's Day
-                e - timedelta(days=2),                 # Good Friday
-                date(year, 5, 1),                      # Labour Day
-                date(year, 8, 17),                     # Independence Day
-                date(year, 12, 25),                    # Christmas Day
-            ]
-
+        lib = _holidays_lib.Indonesia(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── MYR — Kuala Lumpur ────────────────────────────────────────────
     def _myr(self, year: int) -> list:
         # MYR federal holidays include Hari Raya Puasa, Hari Raya Qurban, Awal Muharram,
         # Maulidur Rasul (all Islamic lunar calendar), Chinese New Year, Wesak Day
         # (Buddhist lunar), and a King's Birthday that changes with each new monarch.
         # Observed/substitute days and election days also vary. Delegate to library.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Malaysia(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed secular federal holidays only
-            return [
-                date(year, 5, 1),                      # Labour Day
-                date(year, 8, 31),                     # National Day
-                date(year, 9, 16),                     # Malaysia Day
-                date(year, 12, 25),                    # Christmas Day
-            ]
-
+        lib = _holidays_lib.Malaysia(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── THB — Bangkok ─────────────────────────────────────────────────
     def _thb(self, year: int) -> list:
         # THB holidays include Makha Bucha, Visakha Bucha, Asanha Bucha and Khao Phansa
         # (Buddhist lunar calendar), Songkran (Thai New Year, sometimes moved), royal
         # birthday holidays that changed with King Vajiralongkorn's accession, substitute
         # days (ชดเชย) and government-decreed special holidays. Delegate to library.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Thailand(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed secular holidays only
-            return [
-                date(year, 1, 1),                      # New Year's Day
-                date(year, 4, 6),                      # Chakri Memorial Day
-                date(year, 4, 13),                     # Songkran
-                date(year, 4, 14),
-                date(year, 4, 15),
-                date(year, 5, 1),                      # Labour Day
-                date(year, 8, 12),                     # Queen Mother's Birthday
-                date(year, 10, 23),                    # Chulalongkorn Day
-                date(year, 12, 10),                    # Constitution Day
-                date(year, 12, 31),                    # New Year's Eve
-            ]
-
+        lib = _holidays_lib.Thailand(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── SAR — Riyadh ──────────────────────────────────────────────────
     def _sar(self, year: int) -> list:
         # SAR holidays are primarily Islamic (Eid al-Fitr, Eid al-Adha, Arafat Day),
         # which shift ~11 days earlier each Gregorian year. Founding Day (Feb 22)
         # was added from 2022. Delegate to the library for accurate Islamic dates.
         # Note: Saudi Arabia observes Fri/Sat weekends (not Sat/Sun).
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.SaudiArabia(years=year)
-            # Saudi weekend is Fri+Sat; treat Mon-Thu as business days
-            return [d for d in lib.keys() if d.weekday() < 4 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays only
-            hols = [date(year, 9, 23)]                # National Day
-            if year >= 2022:
-                hols.append(date(year, 2, 22))        # Founding Day
-            return hols
-
+        lib = _holidays_lib.SaudiArabia(years=year)
+        # Saudi weekend is Fri+Sat; treat Mon-Thu as business days
+        return [d for d in lib.keys() if d.weekday() < 4 and d.year == year]
     # ── KRW — Seoul ───────────────────────────────────────────────────
     def _krw(self, year: int) -> list:
         # KRW holidays include Lunar New Year (Seollal), Chuseok (Harvest Festival),
         # and Buddha's Birthday — all on lunar calendar dates that shift each year —
         # plus substitute/bridge days and occasional election days.
         # Delegate to the holidays library for accurate dates.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.SouthKorea(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays only
-            return [
-                date(year, 1, 1),                      # New Year's Day
-                date(year, 3, 1),                      # Independence Movement Day
-                date(year, 5, 5),                      # Children's Day
-                date(year, 6, 6),                      # Memorial Day
-                date(year, 8, 15),                     # Liberation Day
-                date(year, 10, 3),                     # National Foundation Day
-                date(year, 10, 9) if year >= 2013 else None,  # Hangeul Day (restored 2013)
-                date(year, 12, 25),                    # Christmas Day
-            ]
-
+        lib = _holidays_lib.SouthKorea(years=year)
+        return [d for d in lib.keys() if d.year == year]
     # ── TWD — Taipei ──────────────────────────────────────────────────
     def _twd(self, year: int) -> list:
         # TWD holidays include Lunar New Year (Spring Festival), Mid-Autumn Festival,
         # Dragon Boat Festival, and Qingming — all lunar/solar dates that shift each year —
         # plus government-decreed bridge days (補假/放假日) that vary annually.
         # Delegate to the holidays library for accurate dates.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Taiwan(years=year)
-            return [d for d in lib.keys() if d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed holidays only
-            cny_map = {
-                2008: date(2008, 2, 7), 2009: date(2009, 1, 26),
-                2010: date(2010, 2, 14), 2011: date(2011, 2, 3),
-                2012: date(2012, 1, 23), 2013: date(2013, 2, 10),
-                2014: date(2014, 1, 31), 2015: date(2015, 2, 19),
-                2016: date(2016, 2, 8), 2017: date(2017, 1, 28),
-                2018: date(2018, 2, 16), 2019: date(2019, 2, 5),
-                2020: date(2020, 1, 25), 2021: date(2021, 2, 12),
-                2022: date(2022, 2, 1), 2023: date(2023, 1, 22),
-                2024: date(2024, 2, 10), 2025: date(2025, 1, 29),
-            }
-            cny = cny_map.get(year, date(year, 2, 5))
-            return [
-                date(year, 1, 1),                      # Republic Day
-                cny - timedelta(1),                    # New Year Eve
-                cny, cny + timedelta(1),               # Spring Festival Day 1-2
-                cny + timedelta(2), cny + timedelta(3),  # Day 3-4
-                date(year, 2, 28),                     # Peace Memorial Day
-                date(year, 4, 4),                      # Children's Day / Qingming
-                date(year, 10, 10),                    # National Day
-            ]
-
+        lib = _holidays_lib.Taiwan(years=year)
+        return [d for d in lib.keys() if d.year == year]
     # ── RUB — Moscow ──────────────────────────────────────────────────
     def _rub(self, year: int) -> list:
         # Russian holidays include government-decreed bridge/transfer days
         # (Выходной перенесено) that are announced each year and vary unpredictably.
         # Delegate to the library for accurate dates including these transfers.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Russia(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed public holidays only (no bridge days)
-            return [
-                date(year, 1, 1),                      # New Year holidays
-                date(year, 1, 2),
-                date(year, 1, 3),
-                date(year, 1, 4),
-                date(year, 1, 5),
-                date(year, 1, 6),
-                date(year, 1, 7),                      # Orthodox Christmas
-                date(year, 1, 8),
-                date(year, 2, 23),                     # Defender of Fatherland Day
-                date(year, 3, 8),                      # International Women's Day
-                date(year, 5, 1),                      # Spring/Labour Day
-                date(year, 5, 9),                      # Victory Day
-                date(year, 6, 12),                     # Russia Day
-                date(year, 11, 4),                     # National Unity Day
-            ]
-
+        lib = _holidays_lib.Russia(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── TRY — Istanbul ────────────────────────────────────────────────
     def _try(self, year: int) -> list:
         # TRY holidays include Ramazan Bayramı (Eid al-Fitr) and Kurban Bayramı
@@ -1582,25 +1300,8 @@ class HolidayCalendar:
         # Labour Day was added in 2009; Democracy Day in 2017.
         # Republic Day Eve (Oct 28 half-day) is NOT an official public holiday.
         # Delegate to the library for accurate Islamic holiday dates.
-        try:
-            import holidays as hol_lib
-            lib = hol_lib.Turkey(years=year)
-            return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
-        except ImportError:
-            # Minimal fallback — fixed secular holidays only
-            hols = [
-                date(year, 1, 1),                      # New Year's Day
-                date(year, 4, 23),                     # National Sovereignty Day
-                date(year, 5, 19),                     # Atatürk Day
-                date(year, 8, 30),                     # Victory Day
-                date(year, 10, 29),                    # Republic Day
-            ]
-            if year >= 2009:
-                hols.append(date(year, 5, 1))          # Labour Day (from 2009)
-            if year >= 2017:
-                hols.append(date(year, 7, 15))         # Democracy Day (from 2017)
-            return hols
-
+        lib = _holidays_lib.Turkey(years=year)
+        return [d for d in lib.keys() if d.weekday() < 5 and d.year == year]
     # ── Dispatch table ────────────────────────────────────────────────
     # Populated after class definition (references instance methods)
     _GENERATORS: dict = {}
