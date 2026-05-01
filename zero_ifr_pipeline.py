@@ -55,6 +55,7 @@ Usage
     result.report       # full audit log (spike_flags, nan_flags, curve_report)
 """
 
+import os
 import warnings
 from typing import Dict, List, Optional, Tuple
 
@@ -928,24 +929,31 @@ class ZeroIFRPipeline:
 
     # ── plotting ──────────────────────────────────────────────────────────────
 
-    def plot_tenor_timeseries(self, result, save_path=None, dpi=150):
+    def plot_tenor_timeseries(self, result, save_dir=None, dpi=150,
+                              figsize=(13, 4)):
         """
-        Plot all tenors as a grid of subplots in a single figure.
+        Plot the zero rate time series for each tenor in a separate figure.
 
-        Each subplot shows the zero rate time series for one tenor with:
+        Each figure contains one plot showing:
           - Blue line  : raw values
           - Orange line: cleaned values
           - Green dots : positions that were originally NaN (filled)
           - Red dots   : positions where a spike was detected and replaced
 
+        One file is written per tenor when save_dir is provided, named
+        "tenor_{value}.png", e.g. "tenor_365.png", "tenor_730.png".
+
         Parameters
         ----------
-        result    : PipelineResult returned by run()
-        save_path : str or None
-            If given, the figure is saved to this path (e.g. "spikes.png",
-            "spikes.pdf"). If None the figure is displayed interactively.
-        dpi       : int, default 150
+        result   : PipelineResult returned by run()
+        save_dir : str or None
+            Directory to save figures into.  The directory is created if it
+            does not exist.  If None, each figure is displayed interactively
+            one at a time.
+        dpi      : int, default 150
             Resolution used when saving to a raster format (png, jpg).
+        figsize  : tuple, default (13, 4)
+            Width and height of each individual figure in inches.
         """
         try:
             import matplotlib.pyplot as plt
@@ -953,27 +961,13 @@ class ZeroIFRPipeline:
             print("matplotlib not installed.")
             return
 
-        tenors   = list(result.zero_raw.columns)
-        n_tenors = len(tenors)
+        if save_dir is not None and not os.path.exists(save_dir):
+            os.makedirs(save_dir)
 
-        # Build a grid that is as square as possible
-        n_cols = int(np.ceil(np.sqrt(n_tenors)))
-        n_rows = int(np.ceil(n_tenors / float(n_cols)))
+        tenors = list(result.zero_raw.columns)
 
-        fig, axes = plt.subplots(
-            n_rows, n_cols,
-            figsize=(n_cols * 5, n_rows * 3),
-            sharex=False,
-        )
-
-        # Flatten axes array for uniform indexing; handle 1-D case
-        if n_tenors == 1:
-            axes = [axes]
-        else:
-            axes = list(np.array(axes).flatten())
-
-        for i, tenor in enumerate(tenors):
-            ax = axes[i]
+        for tenor in tenors:
+            fig, ax = plt.subplots(figsize=figsize)
 
             ax.plot(
                 result.zero_raw.index,
@@ -991,7 +985,7 @@ class ZeroIFRPipeline:
                 ax.scatter(
                     result.zero_raw.index[nan_pos],
                     result.zero_clean[tenor].values[nan_pos],
-                    color="green", s=12, zorder=5, label="NaN filled",
+                    color="green", s=15, zorder=5, label="NaN filled",
                 )
 
             spk_pos = result.report["spike_flags"][tenor].values
@@ -999,30 +993,25 @@ class ZeroIFRPipeline:
                 ax.scatter(
                     result.zero_raw.index[spk_pos],
                     result.zero_raw[tenor].values[spk_pos],
-                    color="red", s=18, zorder=6, label="spike",
+                    color="red", s=20, zorder=6, label="spike",
                 )
 
-            ax.set_title("Tenor {}".format(tenor), fontsize=9)
-            ax.tick_params(axis="both", labelsize=7)
-            ax.tick_params(axis="x", rotation=30)
+            ax.set_title("Zero rate — tenor {}".format(tenor))
+            ax.set_ylabel("Zero rate")
+            ax.legend(loc="best")
+            ax.xaxis.set_major_locator(plt.MaxNLocator(8))
+            plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
 
-            # Only add legend to the first subplot to avoid clutter
-            if i == 0:
-                ax.legend(fontsize=7, loc="best")
+            if save_dir is not None:
+                fname = os.path.join(
+                    save_dir, "tenor_{}.png".format(tenor)
+                )
+                fig.savefig(fname, dpi=dpi, bbox_inches="tight")
+                print("Saved: {}".format(fname))
+            else:
+                plt.show()
 
-        # Hide any unused subplots
-        for j in range(n_tenors, len(axes)):
-            axes[j].set_visible(False)
-
-        fig.suptitle("Zero rate time series — all tenors", fontsize=11, y=1.01)
-        plt.tight_layout()
-
-        if save_path is not None:
-            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
-            print("Saved: {}".format(save_path))
-        else:
-            plt.show()
-        plt.close(fig)
+            plt.close(fig)
 
     def plot_curve_date(self, date, result, save_path=None, dpi=150,
                         figsize=(13, 4)):
