@@ -58,7 +58,6 @@ Usage
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass
 
 import numpy as np
 import pandas as pd
@@ -639,12 +638,43 @@ class PiecewiseConstantConverter:
 # Result container
 # ══════════════════════════════════════════════════════════════════════════════
 
-@dataclass
 class PipelineResult:
-    zero_raw:   pd.DataFrame   # original input zero rates
-    zero_clean: pd.DataFrame   # zero rates after spike + curvature cleaning
-    ifr_clean:  pd.DataFrame   # piecewise-constant IFRs from clean zeros
-    report:     dict           # audit log
+    """
+    Container for the outputs of ZeroIFRPipeline.run().
+
+    Attributes
+    ----------
+    zero_raw   : pd.DataFrame  — original input zero rates (unchanged)
+    zero_clean : pd.DataFrame  — zero rates after spike + curvature cleaning
+    ifr_clean  : pd.DataFrame  — piecewise-constant IFRs derived from clean zeros
+    report     : dict          — audit log with keys:
+                                   spike_flags, nan_flags, curve_report,
+                                   n_spikes, n_nans, n_abnormal_curves,
+                                   n_sparse_curves
+    """
+
+    def __init__(
+        self,
+        zero_raw:   pd.DataFrame,
+        zero_clean: pd.DataFrame,
+        ifr_clean:  pd.DataFrame,
+        report:     dict,
+    ):
+        self.zero_raw   = zero_raw
+        self.zero_clean = zero_clean
+        self.ifr_clean  = ifr_clean
+        self.report     = report
+
+    def __repr__(self) -> str:
+        shape = self.zero_clean.shape
+        n_spikes = self.report.get("n_spikes", "?")
+        n_curves = self.report.get("n_abnormal_curves", "?")
+        return (
+            f"PipelineResult("
+            f"shape={shape}, "
+            f"n_spikes={n_spikes}, "
+            f"n_abnormal_curves={n_curves})"
+        )
 
 
 # ══════════════════════════════════════════════════════════════════════════════
