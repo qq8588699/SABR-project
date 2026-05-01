@@ -55,9 +55,8 @@ Usage
     result.report       # full audit log (spike_flags, nan_flags, curve_report)
 """
 
-from __future__ import annotations
-
 import warnings
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -68,7 +67,7 @@ from scipy.signal import savgol_filter
 # Robust statistics  (NaN-safe)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _mad_zscore(series: np.ndarray) -> np.ndarray:
+def _mad_zscore(series):
     """
     MAD z-score using only finite values.
     NaN positions in input -> NaN in output (never silently flagged).
@@ -85,7 +84,7 @@ def _mad_zscore(series: np.ndarray) -> np.ndarray:
     return z
 
 
-def _rolling_mad_zscore(series: np.ndarray, window: int = 20) -> np.ndarray:
+def _rolling_mad_zscore(series, window= 20):
     """
     Rolling MAD z-score. Falls back to global z-score where the rolling
     window has fewer than 5 observed values.
@@ -108,7 +107,7 @@ def _rolling_mad_zscore(series: np.ndarray, window: int = 20) -> np.ndarray:
 # Stage 1 — Spike cleaner  (operates on zero rate time series, one tenor)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _dates_to_numeric(dates: pd.Index) -> np.ndarray:
+def _dates_to_numeric(dates):
     """
     Convert any pandas DatetimeIndex (or other index) to a numeric array
     of days elapsed from the first date, preserving the true calendar gaps
@@ -125,7 +124,7 @@ def _dates_to_numeric(dates: pd.Index) -> np.ndarray:
     values are weighted by actual elapsed time, not by row position.
     """
     if isinstance(dates, pd.DatetimeIndex):
-        days = (dates - dates[0]).days.to_numpy(dtype=float)
+        days = (dates - dates[0]).days.values.astype(float)
     else:
         # Fallback for integer or other index types: treat as equally spaced
         days = np.arange(len(dates), dtype=float)
@@ -140,7 +139,7 @@ def _dates_to_numeric(dates: pd.Index) -> np.ndarray:
 _DAYS_PER_YEAR = 365.0
 
 
-def _normalise_index(index: pd.Index) -> tuple[pd.DatetimeIndex, str]:
+def _normalise_index(index):
     """
     Accept any of these row-index formats and return a DatetimeIndex plus
     a format tag so the original format can be restored on output.
@@ -175,7 +174,7 @@ def _normalise_index(index: pd.Index) -> tuple[pd.DatetimeIndex, str]:
     return dt, "datetime"
 
 
-def _restore_index(dt_index: pd.DatetimeIndex, fmt_tag: str) -> pd.Index:
+def _restore_index(dt_index, fmt_tag):
     """
     Convert a DatetimeIndex back to the original format.
 
@@ -241,12 +240,12 @@ class SpikeCleaner:
 
     def __init__(
         self,
-        diff_zscore_thresh: float = 4.0,
-        level_mad_thresh:   float = 6.0,
-        rolling_mad_thresh: float = 5.0,
-        rolling_window:     int   = 20,
-        min_rate:           float = -0.02,
-        max_nan_frac:       float = 0.5,
+        diff_zscore_thresh= 4.0,
+        level_mad_thresh= 6.0,
+        rolling_mad_thresh= 5.0,
+        rolling_window= 20,
+        min_rate= -0.02,
+        max_nan_frac= 0.5,
     ):
         self.diff_zscore_thresh = diff_zscore_thresh
         self.level_mad_thresh   = level_mad_thresh
@@ -257,10 +256,10 @@ class SpikeCleaner:
 
     def _diff_spike_mask(
         self,
-        values:   np.ndarray,
-        nan_mask: np.ndarray,
-        t:        np.ndarray,        # calendar-day positions, same length as values
-    ) -> np.ndarray:
+        values,
+        nan_mask,
+        t,        # calendar-day positions, same length as values
+    ):
         """
         Jump detector on consecutive OBSERVED pairs only.
 
@@ -302,21 +301,21 @@ class SpikeCleaner:
         mask[obs_idx[spike_obs]] = True
         return mask
 
-    def _level_spike_mask(self, values: np.ndarray, nan_mask: np.ndarray) -> np.ndarray:
+    def _level_spike_mask(self, values, nan_mask):
         obs = np.where(nan_mask, np.nan, values)
         z   = _mad_zscore(obs)
         return np.where(np.isnan(z), False, np.abs(z) > self.level_mad_thresh)
 
-    def _rolling_spike_mask(self, values: np.ndarray, nan_mask: np.ndarray) -> np.ndarray:
+    def _rolling_spike_mask(self, values, nan_mask):
         obs = np.where(nan_mask, np.nan, values)
         z   = _rolling_mad_zscore(obs, self.rolling_window)
         return np.where(np.isnan(z), False, np.abs(z) > self.rolling_mad_thresh)
 
     def detect(
         self,
-        values: np.ndarray,
-        t:      np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray]:
+        values,
+        t,
+    ):
         """
         Returns (spike_mask, nan_mask).
         spike_mask: True = observed spike to be replaced (never NaN positions).
@@ -340,11 +339,11 @@ class SpikeCleaner:
 
     def fix(
         self,
-        values:     np.ndarray,
-        spike_mask: np.ndarray,
-        nan_mask:   np.ndarray,
-        t:          np.ndarray,
-    ) -> np.ndarray:
+        values,
+        spike_mask,
+        nan_mask,
+        t,
+    ):
         """
         Linearly interpolate spike and NaN positions from clean neighbours,
         using actual calendar-day positions as the x-axis.
@@ -384,9 +383,9 @@ class SpikeCleaner:
 
     def clean(
         self,
-        values: np.ndarray,
-        t:      np.ndarray,
-    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        values,
+        t,
+    ):
         """
         Two-pass spike cleaning using calendar-aware interpolation.
 
@@ -463,12 +462,12 @@ class CurvatureCleaner:
 
     def __init__(
         self,
-        d2_zscore_thresh: float = 4.0,
-        max_sign_changes: int   = 8,
-        sg_window_frac:   float = 0.25,
-        sg_polyorder:     int   = 3,
-        min_rate:         float = -0.02,
-        max_nan_frac:     float = 0.4,
+        d2_zscore_thresh= 4.0,
+        max_sign_changes= 8,
+        sg_window_frac= 0.25,
+        sg_polyorder= 3,
+        min_rate= -0.02,
+        max_nan_frac= 0.4,
     ):
         self.d2_zscore_thresh = d2_zscore_thresh
         self.max_sign_changes = max_sign_changes
@@ -477,7 +476,7 @@ class CurvatureCleaner:
         self.min_rate         = min_rate
         self.max_nan_frac     = max_nan_frac
 
-    def _d2(self, tenors: np.ndarray, rates: np.ndarray) -> np.ndarray:
+    def _d2(self, tenors, rates):
         """Central-difference d2r/dt2 on irregular observed grid."""
         n  = len(rates)
         d2 = np.full(n, np.nan)
@@ -494,7 +493,7 @@ class CurvatureCleaner:
             if np.isfinite(d2[-2]):  d2[-1] = d2[-2]
         return d2
 
-    def _savgol(self, rates_obs: np.ndarray) -> np.ndarray:
+    def _savgol(self, rates_obs):
         n_obs = len(rates_obs)
         if n_obs < self.sg_polyorder + 2:
             return rates_obs.copy()
@@ -504,7 +503,7 @@ class CurvatureCleaner:
         win = min(win, n_obs if n_obs % 2 == 1 else n_obs - 1)
         return savgol_filter(rates_obs, window_length=win, polyorder=self.sg_polyorder)
 
-    def diagnose(self, tenors: np.ndarray, rates: np.ndarray) -> dict:
+    def diagnose(self, tenors, rates):
         """
         Run curvature diagnostics on observed tenors only.
         Returns dict with keys:
@@ -556,7 +555,7 @@ class CurvatureCleaner:
             needs_fix=needs_fix,
         )
 
-    def fix(self, tenors: np.ndarray, rates: np.ndarray, diag: dict) -> np.ndarray:
+    def fix(self, tenors, rates, diag):
         """
         Savitzky-Golay smooth observed tenors; preserve NaN positions and endpoints.
         """
@@ -572,7 +571,7 @@ class CurvatureCleaner:
         result[obs_mask] = sm
         return result
 
-    def clean(self, tenors: np.ndarray, rates: np.ndarray) -> tuple[np.ndarray, dict]:
+    def clean(self, tenors, rates):
         """Returns (cleaned_rates, diagnostic_dict). NaN positions stay NaN."""
         diag = self.diagnose(tenors, rates)
         return self.fix(tenors, rates, diag), diag
@@ -605,7 +604,7 @@ class PiecewiseConstantConverter:
     after cleaning are positions flagged 'too_sparse' — those propagate.
     """
 
-    def __init__(self, tenors: np.ndarray):
+    def __init__(self, tenors):
         self.tenors  = np.asarray(tenors, dtype=float)
         if np.any(self.tenors <= 0):
             raise ValueError("All tenors must be strictly positive.")
@@ -615,7 +614,7 @@ class PiecewiseConstantConverter:
         self._T_right = self.tenors
         self._dt      = self._T_right - self._T_left
 
-    def zero_to_ifr(self, zero_df: pd.DataFrame) -> pd.DataFrame:
+    def zero_to_ifr(self, zero_df):
         Z         = zero_df.values.astype(float)
         T         = self.tenors
         area      = Z * T[np.newaxis, :]
@@ -624,7 +623,7 @@ class PiecewiseConstantConverter:
         ifr       = (area - area_left) / self._dt[np.newaxis, :]
         return pd.DataFrame(ifr, index=zero_df.index, columns=zero_df.columns)
 
-    def ifr_to_zero(self, ifr_df: pd.DataFrame) -> pd.DataFrame:
+    def ifr_to_zero(self, ifr_df):
         F        = ifr_df.values.astype(float)
         dt       = self._dt[np.newaxis, :]
         cum      = np.nancumsum(F * dt, axis=1)
@@ -655,17 +654,17 @@ class PipelineResult:
 
     def __init__(
         self,
-        zero_raw:   pd.DataFrame,
-        zero_clean: pd.DataFrame,
-        ifr_clean:  pd.DataFrame,
-        report:     dict,
+        zero_raw,
+        zero_clean,
+        ifr_clean,
+        report,
     ):
         self.zero_raw   = zero_raw
         self.zero_clean = zero_clean
         self.ifr_clean  = ifr_clean
         self.report     = report
 
-    def __repr__(self) -> str:
+    def __repr__(self):
         shape = self.zero_clean.shape
         n_spikes = self.report.get("n_spikes", "?")
         n_curves = self.report.get("n_abnormal_curves", "?")
@@ -730,10 +729,10 @@ class ZeroIFRPipeline:
 
     def __init__(
         self,
-        zero_df:      pd.DataFrame,
-        tenor_unit:   str = "days",
-        spike_kwargs: dict | None = None,
-        curve_kwargs: dict | None = None,
+        zero_df,
+        tenor_unit= "days",
+        spike_kwargs=None,
+        curve_kwargs=None,
     ):
         if tenor_unit not in ("days", "years"):
             raise ValueError(f"tenor_unit must be 'days' or 'years', got {tenor_unit!r}")
@@ -775,7 +774,7 @@ class ZeroIFRPipeline:
 
     # ── private: restore original index and column labels ────────────────────
 
-    def _restore_output(self, df_internal: pd.DataFrame) -> pd.DataFrame:
+    def _restore_output(self, df_internal):
         """
         Given an internal DataFrame (DatetimeIndex, float-day columns),
         return a copy with the original index format and original column labels.
@@ -790,8 +789,8 @@ class ZeroIFRPipeline:
     # ── cleaning steps ────────────────────────────────────────────────────────
 
     def _step1_spikes(
-        self, zero_df: pd.DataFrame, verbose: bool
-    ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+        self, zero_df, verbose: bool
+    ):
         """Spike removal on each zero rate tenor series."""
         sc          = SpikeCleaner(**self.spike_kw)
         cleaned     = zero_df.copy()
@@ -819,8 +818,8 @@ class ZeroIFRPipeline:
         return cleaned, spike_flags, nan_flags
 
     def _step2_curvature(
-        self, zero_df: pd.DataFrame, verbose: bool
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        self, zero_df, verbose: bool
+    ):
         """Curvature correction on each date's zero rate curve."""
         cc         = CurvatureCleaner(**self.curve_kw)
         cleaned    = zero_df.copy()
@@ -851,7 +850,7 @@ class ZeroIFRPipeline:
 
     # ── main entry point ──────────────────────────────────────────────────────
 
-    def run(self, verbose: bool = True) -> PipelineResult:
+    def run(self, verbose= True):
         """
         Execute the three-step pipeline.
 
