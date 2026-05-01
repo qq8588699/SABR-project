@@ -192,26 +192,22 @@ class SpikeCleaner:
     Detect and replace spikes in a 1-D zero rate time series.
 
     Because we are cleaning in zero rate space, a spike in r(T_k, t) affects
-    exactly ONE series. Three complementary detectors are run in parallel:
+    exactly ONE series. Two complementary detectors are run in parallel:
 
       A. Jump detector  — |Δr| is large on both sides of the point,
                           ruling out genuine level shifts (one large jump).
                           Computed only between consecutive *observed* pairs
                           so NaN gaps do not corrupt the differences.
 
-      B. Global MAD     — level is far from the full-sample median.
-                          Catches e.g. decimal/percent conversion errors.
-
-      C. Rolling MAD    — level is far from the local (windowed) median.
-                          Catches regime-local anomalies invisible to (B).
+      B. Rolling MAD    — level is far from the local (windowed) median.
+                          Adapts to regime shifts so long-run level changes
+                          do not produce false positives.
 
     NaN positions are NEVER flagged as spikes; they are tracked separately
     and filled from the same clean-neighbour interpolation pool.
 
     Non-consecutive date handling
     -----------------------------
-    Three places depend on the x-axis used for interpolation or windowing:
-
       fix()              — np.interp uses calendar days, not integer positions,
                            so a spike between dates 5 days apart is interpolated
                            differently from one between dates 1 day apart.
@@ -226,12 +222,10 @@ class SpikeCleaner:
       _rolling_mad_zscore (via rolling_window) — the rolling window parameter
                            is expressed in number of *observations* (rows), not
                            calendar days, so it already adapts naturally to gaps.
-                           No change needed there.
 
     Parameters
     ----------
     diff_zscore_thresh : float, default 4.0
-    level_mad_thresh   : float, default 6.0
     rolling_mad_thresh : float, default 5.0
     rolling_window     : int,   default 20
     min_rate           : float, default -0.02   hard floor (−2 %)
@@ -240,15 +234,13 @@ class SpikeCleaner:
 
     def __init__(
         self,
-        diff_zscore_thresh= 4.0,
-        level_mad_thresh= 6.0,
-        rolling_mad_thresh= 5.0,
-        rolling_window= 20,
-        min_rate= -0.02,
-        max_nan_frac= 0.5,
+        diff_zscore_thresh=4.0,
+        rolling_mad_thresh=5.0,
+        rolling_window=20,
+        min_rate=-0.02,
+        max_nan_frac=0.5,
     ):
         self.diff_zscore_thresh = diff_zscore_thresh
-        self.level_mad_thresh   = level_mad_thresh
         self.rolling_mad_thresh = rolling_mad_thresh
         self.rolling_window     = rolling_window
         self.min_rate           = min_rate
@@ -301,11 +293,6 @@ class SpikeCleaner:
         mask[obs_idx[spike_obs]] = True
         return mask
 
-    def _level_spike_mask(self, values, nan_mask):
-        obs = np.where(nan_mask, np.nan, values)
-        z   = _mad_zscore(obs)
-        return np.where(np.isnan(z), False, np.abs(z) > self.level_mad_thresh)
-
     def _rolling_spike_mask(self, values, nan_mask):
         obs = np.where(nan_mask, np.nan, values)
         z   = _rolling_mad_zscore(obs, self.rolling_window)
@@ -321,6 +308,18 @@ class SpikeCleaner:
         spike_mask: True = observed spike to be replaced (never NaN positions).
         nan_mask:   True = originally missing.
 
+        Detection steps
+        ---------------
+        A. Jump detector  — large normalised jump in AND out of the point
+        B. Rolling MAD    — level far from local rolling median
+        C. Hard floor     — value below min_rate
+
+        Note: the global level MAD detector has been intentionally removed.
+        It was sensitive to regime shifts over long histories where the full-
+        sample median is a poor reference, causing false positives during
+        sustained rate moves. The rolling MAD detector (B) covers the same
+        intent with a local reference that adapts to the current level.
+
         Parameters
         ----------
         values : ndarray   — zero rate values
@@ -330,7 +329,6 @@ class SpikeCleaner:
         nan_mask   = ~np.isfinite(values)
         spike_mask = (
             self._diff_spike_mask(values, nan_mask, t)
-            | self._level_spike_mask(values, nan_mask)
             | self._rolling_spike_mask(values, nan_mask)
             | ((~nan_mask) & (values < self.min_rate))
         )
@@ -930,60 +928,159 @@ class ZeroIFRPipeline:
 
     # ── plotting ──────────────────────────────────────────────────────────────
 
-    def plot_tenor_timeseries(self, tenor, result, figsize=(13, 4)):
-        """Zero rate time series for one tenor: raw vs clean, spikes marked."""
+    def plot_tenor_timeseries(self, result, save_path=None, dpi=150):
+        """
+        Plot all tenors as a grid of subplots in a single figure.
+
+        Each subplot shows the zero rate time series for one tenor with:
+          - Blue line  : raw values
+          - Orange line: cleaned values
+          - Green dots : positions that were originally NaN (filled)
+          - Red dots   : positions where a spike was detected and replaced
+
+        Parameters
+        ----------
+        result    : PipelineResult returned by run()
+        save_path : str or None
+            If given, the figure is saved to this path (e.g. "spikes.png",
+            "spikes.pdf"). If None the figure is displayed interactively.
+        dpi       : int, default 150
+            Resolution used when saving to a raster format (png, jpg).
+        """
         try:
             import matplotlib.pyplot as plt
         except ImportError:
-            print("matplotlib not installed."); return
-        fig, ax = plt.subplots(figsize=figsize)
-        ax.plot(result.zero_raw.index,   result.zero_raw[tenor],
-                lw=1,   alpha=0.6, color="steelblue",  label="zero raw")
-        ax.plot(result.zero_clean.index, result.zero_clean[tenor],
-                lw=1.2, color="darkorange", label="zero clean")
-        nan_pos = result.report["nan_flags"][tenor]
-        ax.scatter(result.zero_raw.index[nan_pos],
-                   result.zero_clean[tenor][nan_pos],
-                   color="green", s=15, zorder=5, label="NaN (filled)")
-        spk_pos = result.report["spike_flags"][tenor]
-        ax.scatter(result.zero_raw.index[spk_pos],
-                   result.zero_raw[tenor][spk_pos],
-                   color="red", s=25, zorder=6, label="spike fixed")
-        ax.set_title(f"Zero rate — tenor {tenor}y")
-        ax.set_ylabel("Zero rate"); ax.legend()
-        plt.tight_layout(); plt.show()
+            print("matplotlib not installed.")
+            return
 
-    def plot_curve_date(self, date, result, figsize=(13, 4)):
+        tenors   = list(result.zero_raw.columns)
+        n_tenors = len(tenors)
+
+        # Build a grid that is as square as possible
+        n_cols = int(np.ceil(np.sqrt(n_tenors)))
+        n_rows = int(np.ceil(n_tenors / float(n_cols)))
+
+        fig, axes = plt.subplots(
+            n_rows, n_cols,
+            figsize=(n_cols * 5, n_rows * 3),
+            sharex=False,
+        )
+
+        # Flatten axes array for uniform indexing; handle 1-D case
+        if n_tenors == 1:
+            axes = [axes]
+        else:
+            axes = list(np.array(axes).flatten())
+
+        for i, tenor in enumerate(tenors):
+            ax = axes[i]
+
+            ax.plot(
+                result.zero_raw.index,
+                result.zero_raw[tenor].values,
+                lw=0.8, alpha=0.6, color="steelblue", label="raw",
+            )
+            ax.plot(
+                result.zero_clean.index,
+                result.zero_clean[tenor].values,
+                lw=1.0, color="darkorange", label="clean",
+            )
+
+            nan_pos = result.report["nan_flags"][tenor].values
+            if nan_pos.any():
+                ax.scatter(
+                    result.zero_raw.index[nan_pos],
+                    result.zero_clean[tenor].values[nan_pos],
+                    color="green", s=12, zorder=5, label="NaN filled",
+                )
+
+            spk_pos = result.report["spike_flags"][tenor].values
+            if spk_pos.any():
+                ax.scatter(
+                    result.zero_raw.index[spk_pos],
+                    result.zero_raw[tenor].values[spk_pos],
+                    color="red", s=18, zorder=6, label="spike",
+                )
+
+            ax.set_title("Tenor {}".format(tenor), fontsize=9)
+            ax.tick_params(axis="both", labelsize=7)
+            ax.tick_params(axis="x", rotation=30)
+
+            # Only add legend to the first subplot to avoid clutter
+            if i == 0:
+                ax.legend(fontsize=7, loc="best")
+
+        # Hide any unused subplots
+        for j in range(n_tenors, len(axes)):
+            axes[j].set_visible(False)
+
+        fig.suptitle("Zero rate time series — all tenors", fontsize=11, y=1.01)
+        plt.tight_layout()
+
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print("Saved: {}".format(save_path))
+        else:
+            plt.show()
+        plt.close(fig)
+
+    def plot_curve_date(self, date, result, save_path=None, dpi=150,
+                        figsize=(13, 4)):
         """
         For one date: zero curve (raw vs clean) and the resulting
         piecewise-constant IFR derived from the clean zeros.
+
+        Parameters
+        ----------
+        date      : a date label matching the index of result.zero_raw
+        result    : PipelineResult returned by run()
+        save_path : str or None
+            If given, the figure is saved to this path. If None the figure
+            is displayed interactively.
+        dpi       : int, default 150
+            Resolution used when saving to a raster format.
+        figsize   : tuple, default (13, 4)
         """
         try:
             import matplotlib.pyplot as plt
         except ImportError:
-            print("matplotlib not installed."); return
+            print("matplotlib not installed.")
+            return
+
         T   = self.tenors
         fig, axes = plt.subplots(1, 2, figsize=figsize)
 
         ax = axes[0]
-        ax.plot(T, result.zero_raw.loc[date].values,   lw=1.5,
-                color="steelblue",              label="zero raw")
+        ax.plot(T, result.zero_raw.loc[date].values, lw=1.5,
+                color="steelblue", label="zero raw")
         ax.plot(T, result.zero_clean.loc[date].values, lw=1.5,
-                color="darkorange", ls="--",    label="zero clean")
+                color="darkorange", ls="--", label="zero clean")
         nan_mask = ~np.isfinite(result.zero_raw.loc[date].values)
         if nan_mask.any():
-            ax.scatter(T[nan_mask], result.zero_clean.loc[date].values[nan_mask],
+            ax.scatter(T[nan_mask],
+                       result.zero_clean.loc[date].values[nan_mask],
                        color="green", s=30, zorder=5, label="NaN (filled)")
-        ax.set_title(f"Zero curve — {date}"); ax.set_xlabel("Tenor (y)")
-        ax.set_ylabel("Zero rate"); ax.legend()
+        ax.set_title("Zero curve — {}".format(date))
+        ax.set_xlabel("Tenor")
+        ax.set_ylabel("Zero rate")
+        ax.legend()
 
         ax = axes[1]
         ax.step(T, result.ifr_clean.loc[date].values, where="post",
                 lw=1.5, color="purple", label="IFR (from clean zeros)")
-        ax.set_title(f"Piecewise-constant IFR — {date}")
-        ax.set_xlabel("Tenor (y)"); ax.set_ylabel("Forward rate"); ax.legend()
+        ax.set_title("Piecewise-constant IFR — {}".format(date))
+        ax.set_xlabel("Tenor")
+        ax.set_ylabel("Forward rate")
+        ax.legend()
 
-        plt.tight_layout(); plt.show()
+        plt.tight_layout()
+
+        if save_path is not None:
+            fig.savefig(save_path, dpi=dpi, bbox_inches="tight")
+            print("Saved: {}".format(save_path))
+        else:
+            plt.show()
+        plt.close(fig)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
