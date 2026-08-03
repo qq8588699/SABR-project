@@ -174,26 +174,89 @@ def trades_to_dataframe(trades, multi_level_columns=False):
     return df
  
  
+def parse_file_to_dataframe(path, multi_level_columns=False, skip_first_line=True):
+    """
+    Parse a single file into a DataFrame. Designed to be called in a
+    worker process, so it does all the file I/O + parsing + framing itself
+    and returns a plain DataFrame (safe to pass back between processes).
+    """
+    with open(path, "r") as f:
+        if skip_first_line:
+            f.readline()
+        content = f.read()
+ 
+    trades = parse_all_trade_data(content)
+    df = trades_to_dataframe(trades, multi_level_columns=multi_level_columns)
+    df.insert(0, "source_file", path)  # track which file each row came from
+    return df
+ 
+ 
+def parse_files_parallel(paths, multi_level_columns=False, skip_first_line=True,
+                          max_workers=None):
+    """
+    Parse many files in parallel using a process pool, then concatenate
+    the resulting DataFrames into one.
+ 
+    max_workers=None lets Python pick based on CPU count.
+    """
+    import pandas as pd
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+ 
+    dfs = []
+    errors = []
+ 
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        future_to_path = {
+            executor.submit(
+                parse_file_to_dataframe, path, multi_level_columns, skip_first_line
+            ): path
+            for path in paths
+        }
+        for future in as_completed(future_to_path):
+            path = future_to_path[future]
+            try:
+                dfs.append(future.result())
+            except Exception as exc:
+                errors.append((path, exc))
+ 
+    if errors:
+        print(f"WARNING: {len(errors)} file(s) failed to parse:")
+        for path, exc in errors:
+            print(f"  {path}: {exc}")
+ 
+    if not dfs:
+        return pd.DataFrame()
+ 
+    combined = pd.concat(dfs, ignore_index=True)
+    return combined
+ 
+ 
 if __name__ == "__main__":
     import sys
     import json
  
-    in_path = sys.argv[1] if len(sys.argv) > 1 else "x.proto"
-    out_path = sys.argv[2] if len(sys.argv) > 2 else "trades.csv"
+    args = sys.argv[1:]
+    if not args:
+        print("Usage: python3 parse_trade_data.py file1.proto [file2.proto ...] output.csv")
+        sys.exit(1)
  
-    with open(in_path, "r") as f:
-        f.readline()  # skip the first line
-        content = f.read()
+    # Last argument is treated as the output CSV path, everything before it
+    # is treated as input files. If only one argument is given, default the
+    # output name.
+    if len(args) == 1:
+        in_paths = [args[0]]
+        out_path = "trades.csv"
+    else:
+        in_paths = args[:-1]
+        out_path = args[-1]
  
-    trades = parse_all_trade_data(content)
-    print(f"Parsed {len(trades)} trade_data record(s)")
+    if len(in_paths) == 1:
+        # Single file: no need for a process pool
+        df = parse_file_to_dataframe(in_paths[0], multi_level_columns=False)
+    else:
+        # Multiple files: parse in parallel, then concatenate
+        df = parse_files_parallel(in_paths, multi_level_columns=False)
  
-    if trades:
-        # Print the first record as pretty JSON so you can inspect the structure
-        print(json.dumps(trades[0], indent=2))
+    df.to_csv(out_path, index=False)
+    print(f"Saved {len(df)} rows x {len(df.columns)} columns to {out_path}")
  
-        # Set multi_level_columns=True for a MultiIndex column header instead
-        # of dotted names.
-        df = trades_to_dataframe(trades, multi_level_columns=True)
-        df.to_csv(out_path, index=False)
-        print(f"Saved {len(df)} rows x {len(df.columns)} columns to {out_path}")
