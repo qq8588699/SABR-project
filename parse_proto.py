@@ -150,13 +150,28 @@ def parse_all_trade_data(text):
     return records
  
  
-def trades_to_dataframe(trades):
+def trades_to_dataframe(trades, multi_level_columns=False):
     """
     Flatten a list of nested trade_data dicts into a pandas DataFrame.
-    Nested fields become dotted column names, e.g. tol_data.tolerance.status
+ 
+    If multi_level_columns is False (default):
+        Nested fields become dotted column names, e.g. tol_data.tolerance.status
+ 
+    If multi_level_columns is True:
+        Columns become a MultiIndex, e.g. ('tol_data', 'tolerance', 'status')
+        Shorter paths are padded with '' so all column tuples have equal length.
     """
     import pandas as pd
-    return pd.json_normalize(trades, sep=".")
+ 
+    df = pd.json_normalize(trades, sep=".")
+ 
+    if multi_level_columns:
+        split_cols = [tuple(col.split(".")) for col in df.columns]
+        max_depth = max(len(c) for c in split_cols)
+        padded_cols = [c + ("",) * (max_depth - len(c)) for c in split_cols]
+        df.columns = pd.MultiIndex.from_tuples(padded_cols)
+ 
+    return df
  
  
 if __name__ == "__main__":
@@ -177,6 +192,8 @@ if __name__ == "__main__":
         # Print the first record as pretty JSON so you can inspect the structure
         print(json.dumps(trades[0], indent=2))
  
-        df = trades_to_dataframe(trades)
+        # Set multi_level_columns=True for a MultiIndex column header instead
+        # of dotted names.
+        df = trades_to_dataframe(trades, multi_level_columns=True)
         df.to_csv(out_path, index=False)
         print(f"Saved {len(df)} rows x {len(df.columns)} columns to {out_path}")
