@@ -42,15 +42,31 @@ class ShadowRateTransformation:
         s <  r*:  r = r_floor + (r* - r_floor) * exp((s - r*) / delta)
     """
 
-    def __init__(self, switch_point: float, floor: float):
-        if floor >= switch_point:
+    def __init__(self, switch_point, floor):
+        # type: (Union[float, np.ndarray], Union[float, np.ndarray]) -> None
+        """
+        Parameters
+        ----------
+        switch_point : float or array-like of shape (n_tenors,)
+            The rate level r* per tenor. Pass a scalar when all tenors share
+            the same switch point, or a 1-D array with one value per column
+            when using the DataFrame methods df_to_shadow / df_from_shadow.
+        floor : float or array-like of shape (n_tenors,)
+            The asymptotic floor r_floor per tenor. Must be element-wise
+            strictly less than switch_point.
+        """
+        switch_point = np.asarray(switch_point, dtype=float)
+        floor        = np.asarray(floor,        dtype=float)
+
+        if np.any(floor >= switch_point):
             raise ValueError(
-                f"floor ({floor}) must be strictly less than "
-                f"switch_point ({switch_point})."
+                "floor must be strictly less than switch_point for all tenors. "
+                "Got floor={}, switch_point={}.".format(floor, switch_point)
             )
+
         self.switch_point = switch_point
-        self.floor = floor
-        self.delta = switch_point - floor
+        self.floor        = floor
+        self.delta        = switch_point - floor
 
     # ------------------------------------------------------------------
     # Forward transformation: r -> s
@@ -167,6 +183,91 @@ class ShadowRateTransformation:
         )
 
         return float(jac[0]) if scalar_input else jac
+
+    # ------------------------------------------------------------------
+    # DataFrame vectorised methods
+    # ------------------------------------------------------------------
+
+    def df_to_shadow(self, df):
+        """Apply the forward transformation T(r) to every element of a DataFrame.
+
+        Each column is treated as a time series of instantaneous forward rates
+        at a given tenor. The transformation is fully vectorised across all
+        columns and rows simultaneously using numpy broadcasting — no Python
+        loop over columns or rows is used.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame of instantaneous forward rates. All values must be
+            strictly above the floor. Shape: (n_dates, n_tenors).
+
+        Returns
+        -------
+        pd.DataFrame
+            Shadow rates s = T(r), same shape, index and columns as df.
+
+        Raises
+        ------
+        ValueError
+            If any value in df is at or below the floor.
+        """
+        import pandas as pd
+        values = df.values.astype(float)   # shape: (n_dates, n_tenors)
+
+        # Reshape per-tenor parameters to (1, n_tenors) so they broadcast
+        # across all rows (dates) without any explicit loop.
+        sp    = self.switch_point.reshape(1, -1) if self.switch_point.ndim > 0 else self.switch_point
+        fl    = self.floor.reshape(1, -1)        if self.floor.ndim > 0        else self.floor
+        delta = self.delta.reshape(1, -1)        if self.delta.ndim > 0        else self.delta
+
+        if np.any(values <= fl):
+            raise ValueError(
+                "All rates must be strictly above the floor. "
+                "Got min = {:.6f}.".format(np.min(values))
+            )
+
+        shadow_values = np.where(
+            values >= sp,
+            values,
+            sp + delta * np.log((values - fl) / (sp - fl))
+        )
+
+        return pd.DataFrame(shadow_values, index=df.index, columns=df.columns)
+
+    def df_from_shadow(self, df):
+        """Apply the inverse transformation T^{-1}(s) to every element of a DataFrame.
+
+        Converts a DataFrame of shadow rates back to instantaneous forward rates.
+        The transformation is fully vectorised across all columns and rows
+        simultaneously using numpy broadcasting — no Python loop is used.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            DataFrame of shadow rates. Shape: (n_dates, n_tenors).
+
+        Returns
+        -------
+        pd.DataFrame
+            Instantaneous forward rates r = T^{-1}(s), same shape, index
+            and columns as df. All values are guaranteed to be > floor.
+        """
+        import pandas as pd
+        values = df.values.astype(float)   # shape: (n_dates, n_tenors)
+
+        # Reshape per-tenor parameters to (1, n_tenors) for broadcasting.
+        sp    = self.switch_point.reshape(1, -1) if self.switch_point.ndim > 0 else self.switch_point
+        fl    = self.floor.reshape(1, -1)        if self.floor.ndim > 0        else self.floor
+        delta = self.delta.reshape(1, -1)        if self.delta.ndim > 0        else self.delta
+
+        rate_values = np.where(
+            values >= sp,
+            values,
+            fl + (sp - fl) * np.exp((values - sp) / delta)
+        )
+
+        return pd.DataFrame(rate_values, index=df.index, columns=df.columns)
 
     # ------------------------------------------------------------------
     # Monte Carlo simulation
