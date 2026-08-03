@@ -150,19 +150,33 @@ def parse_all_trade_data(text):
     return records
  
  
+def trades_to_dataframe(trades):
+    """
+    Flatten a list of nested trade_data dicts into a pandas DataFrame.
+    Nested fields become dotted column names, e.g. tol_data.tolerance.status
+    """
+    import pandas as pd
+    return pd.json_normalize(trades, sep=".")
+ 
+ 
 if __name__ == "__main__":
     import sys
     import json
  
-    path = sys.argv[1] if len(sys.argv) > 1 else "x.proto"
+    in_path = sys.argv[1] if len(sys.argv) > 1 else "x.proto"
+    out_path = sys.argv[2] if len(sys.argv) > 2 else "trades.csv"
  
-    with open(path, "r") as f:
+    with open(in_path, "r") as f:
         f.readline()  # skip the first line
         content = f.read()
  
     trades = parse_all_trade_data(content)
     print(f"Parsed {len(trades)} trade_data record(s)")
  
-    # Print the first record as pretty JSON so you can inspect the structure
     if trades:
+        # Print the first record as pretty JSON so you can inspect the structure
         print(json.dumps(trades[0], indent=2))
+ 
+        df = trades_to_dataframe(trades)
+        df.to_csv(out_path, index=False)
+        print(f"Saved {len(df)} rows x {len(df.columns)} columns to {out_path}")
